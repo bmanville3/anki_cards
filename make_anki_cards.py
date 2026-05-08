@@ -1,29 +1,5 @@
-#!/usr/bin/env python3
-"""
-make_anki_cards.py
-Generates an Anki deck (.apkg) from a .vtt transcript + .mp4 video file.
-100% local — no API calls.
-
-Translations (both optional, off by default):
-  1) Full sentence: Helsinki-NLP opus-mt via HuggingFace (~300MB, best free local MT)
-  2) Word-for-word: fugashi (MeCab) tokenizer + jamdict (JMdict) dictionary lookup
-
-
-Each card:
-  Front: Japanese text + audio clip (random font per card)
-  Back:  video frame + sentence translation + word gloss + source + blank Notes field
-
-Usage:
-  python make_anki_cards.py
-
-Flags:
-  --deck-name "Winter Vacation"
-  --frame-offset 1.0     Seconds after chunk start to grab frame (default: 1.0)
-"""
-
 import argparse
 import os
-import random
 import re
 import subprocess
 import sys
@@ -31,6 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 import uuid
+import shutil
 
 try:
     import genanki
@@ -51,28 +28,36 @@ if not PROCESSED_DIR.exists():
 if not PROCESSED_DIR.is_dir():
     raise ValueError(f"Please make sure {PROCESSED_DIR} is a dir")
 
+FONTS_DIR = Path("./fonts")
 
-
-# Japanese web fonts - rotated per card
+# Japanese fonts - rotated per card.
 JAPANESE_FONTS = [
-    "Noto Sans JP",
-    "Noto Serif JP",
-    "M PLUS 1p",
-    "M PLUS Rounded 1c",
-    "Kosugi Maru",
-    "Sawarabi Gothic",
-    "Sawarabi Mincho",
-    "Zen Kaku Gothic New",
-    "Zen Antique",
-    "Shippori Mincho",
+    "NotoSansJP-Regular",
+    "NotoSerifJP-Regular",
+    "MPLUSRounded1c-Regular",
+    "MPLUS1p-Regular",
+    "KosugiMaru-Regular",
+    "SawarabiGothic-Regular",
+    "SawarabiMincho-Regular",
+    "ZenKakuGothicNew-Regular",
+    "ZenAntique-Regular",
+    "ShipporiMincho-Regular",
 ]
 
-GOOGLE_FONTS_CSS = "\n".join(
-    '@import url("https://fonts.googleapis.com/css2?family={}&display=swap");'.format(
-        f.replace(" ", "+")
-    )
-    for f in JAPANESE_FONTS
-)
+def build_font_face_css(fonts_dir: Path) -> str:
+    """Build @font-face blocks for every .ttf in fonts_dir."""
+    if not fonts_dir.exists():
+        print(f"  Warning: {fonts_dir} not found — no local fonts will be embedded.")
+        return ""
+    css_blocks = []
+    for ttf in sorted(fonts_dir.glob("*.ttf")):
+        family_name = ttf.stem.replace("-", " ").replace("_", " ")
+        css_blocks.append(
+            f"@font-face {{ font-family: '{family_name}'; src: url('{ttf.name}'); }}"
+        )
+    if not css_blocks:
+        print(f"  Warning: no .ttf files found in {fonts_dir}.")
+    return "\n".join(css_blocks)
 
 
 @dataclass
@@ -117,68 +102,7 @@ def parse_vtt(vtt_path: str) -> list:
     return chunks
 
 
-# ── Sentence translation: Helsinki-NLP opus-mt (HuggingFace, local) ──────────
-# no longer using
-# _SENT_END_RE = re.compile(r'([。．！!？?])')
-# _ELLIPSIS_RE = re.compile(r'[…‥]|・・・|\.\.\.')
-
-# _mt_pipeline = None
-
-# def setup_sentence_translator() -> bool:
-#     global _mt_pipeline
-#     try:
-#         from transformers import pipeline
-#         print("Loading Helsinki-NLP/opus-mt-ja-en...")
-#         _mt_pipeline = pipeline(
-#             "translation",
-#             model="Helsinki-NLP/opus-mt-ja-en",
-#             device=-1,   # CPU; change to 0 for GPU
-#         )
-#         print("  Sentence translation model ready.")
-#         return True
-#     except ImportError:
-#         print("  transformers/sentencepiece not installed.")
-#         print("  pip install transformers sentencepiece")
-#         return False
-#     except Exception as e:
-#         print(f"  Failed to load translation model: {e}")
-#         return False
-
-# def preprocess_for_translation(text: str) -> list[str]:
-#     text = re.sub(r"\s+", " ", text.strip())
-#     text = _ELLIPSIS_RE.sub(' ', text)
-#     text = re.sub(r' +', ' ', text).strip()
-    
-#     parts = _SENT_END_RE.split(text)
-    
-#     sentences = []
-#     for i in range(0, len(parts) - 1, 2):
-#         segment = parts[i] + parts[i + 1]
-#         segment = segment.strip()
-#         if segment:
-#             sentences.append(segment)
-    
-#     if len(parts) % 2 == 1 and parts[-1].strip():
-#         sentences.append(parts[-1].strip())
-    
-#     return sentences if sentences else [text]
-
-# def translate_sentence(text: str) -> str:
-#     if _mt_pipeline is None:
-#         return ""
-#     try:
-#         sentences = preprocess_for_translation(text)
-#         print(sentences)
-#         print("---")
-#         results = []
-#         for s in sentences:
-#             r = _mt_pipeline(s, max_length=512)
-#             results.append(r[0]["translation_text"])
-
-#         return " ".join(results)
-#     except Exception as e:
-#         print(f"  Translation error: {e}")
-#         return ""
+# ── Sentence translation: Qwen2.5 via llama-cpp ──────────────────────────────
 
 MODEL_PATH = os.path.expanduser("~/models/Qwen2.5-7B-Instruct-Q5_K_M.gguf")
 
@@ -229,7 +153,7 @@ def translate_sentence(text: str) -> str:
                 {"role": "user",   "content": prompt},
             ],
             max_tokens=512,
-            temperature=0.1,   # low temp = more deterministic/literal
+            temperature=0.1,
         )
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
@@ -237,9 +161,54 @@ def translate_sentence(text: str) -> str:
         return ""
 
 
+# ── TTS: Kokoro (local, offline) ──────────────────────────────────────────────
+
+KOKORO_MODEL_PATH  = os.path.expanduser("~/models/kokoro/kokoro-v1.0.onnx")
+KOKORO_VOICES_PATH = os.path.expanduser("~/models/kokoro/voices-v1.0.bin")
+
+_kokoro = None
+
+def setup_tts() -> bool:
+    global _kokoro
+    try:
+        from kokoro_onnx import Kokoro
+        print(f"Loading Kokoro TTS...")
+        _kokoro = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
+        print("  TTS ready (Kokoro).")
+        return True
+    except ImportError:
+        print("  kokoro-onnx not installed.  pip install kokoro-onnx soundfile")
+        return False
+    except Exception as e:
+        print(f"  Failed to load Kokoro: {e}")
+        return False
+
+
+def generate_tts(text: str, out_path: str, voice: str = "af_heart") -> bool:
+    """Synthesize English text to an mp3 file. Returns True on success."""
+    if _kokoro is None or not text.strip():
+        return False
+    try:
+        import soundfile as sf
+        samples, sample_rate = _kokoro.create(text, voice=voice, speed=1.0, lang="en-us")
+        # soundfile writes wav; ffmpeg converts to mp3 so Anki handles it fine
+        wav_path = out_path.replace(".mp3", "_tts_tmp.wav")
+        sf.write(wav_path, samples, sample_rate)
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-q:a", "4", out_path],
+            capture_output=True,
+        )
+        Path(wav_path).unlink(missing_ok=True)
+        if r.returncode != 0:
+            print(f"  TTS ffmpeg error: {r.stderr.decode(errors='replace')[-200:]}")
+            return False
+        return True
+    except Exception as e:
+        print(f"  TTS error: {e}")
+        return False
+
+
 # ── Word-for-word gloss: fugashi (MeCab) + jamdict (JMdict) ──────────────────
-# fugashi tokenizes Japanese text into morphemes.
-# jamdict looks each one up in JMdict — the same dictionary Yomitan uses.
 
 _tagger = None
 _jmd    = None
@@ -273,10 +242,9 @@ def setup_word_glosser() -> bool:
     return ok
 
 
-# Parts of speech to skip in the gloss (punctuation, particles, auxiliaries, etc.)
 _SKIP_POS = {
-    "助詞",      # particles (は, が, を, に, ...)
-    "助動詞",    # auxiliary verbs (です, ます, ...)
+    "助詞",      # particles
+    "助動詞",    # auxiliary verbs
     "記号",      # punctuation / symbols
     "補助記号",  # supplementary symbols
     "空白",      # whitespace
@@ -287,7 +255,6 @@ def _has_kanji(s: str) -> bool:
 
 
 def _kana_to_hiragana(s: str) -> str:
-    """Convert katakana to hiragana (MeCab readings are katakana)."""
     return "".join(
         chr(ord(c) - 0x60) if '\u30a1' <= c <= '\u30f6' else c
         for c in s
@@ -311,7 +278,7 @@ _GLOSS_SELECTION_SYSTEM = (
     "If the word has an extremely common definition outside of the context, return the context definition number(s) and the very common definition number(s) "
     "However, bias toward returning the context definition number(s) "
     "If multiple definitions could fit the sentence, return each definition. "
-    "Make sure you respond in a comma spearate list of number like a csv "
+    "Make sure you respond in a comma separate list of numbers like a csv "
     "no explanations, no other text. Example output: 1,3 "
 )
 
@@ -319,21 +286,19 @@ def _extract_from_llm_prompt(context: str, surface: str, result) -> tuple[list, 
     if _llm is None:
         return _extract_from_cutting(result=result)
     senses = [s for e in result.entries for s in e.senses]
-    meanings_and_pos = set()
+    seen = set()
+    meanings = []
+    poses = []
     for sense in senses:
         glosses = [g.text for g in sense.gloss]
         if glosses:
-            new_pos = "/".join(sorted(str(p) for p in sense.pos))
+            new_pos     = "/".join(sorted(str(p) for p in sense.pos))
             new_meaning = ", ".join(glosses)
-            combined = (new_meaning, new_pos)
-            if not combined in meanings_and_pos:
-                meanings_and_pos.add(meanings_and_pos)
-    
-    meanings = []
-    poses = []
-    for new_meaning, new_pos in meanings_and_pos:
-        meanings.append(new_meaning)
-        poses.append(new_pos)
+            key = (new_meaning, new_pos)
+            if key not in seen:
+                seen.add(key)
+                meanings.append(new_meaning)
+                poses.append(new_pos)
 
     if not meanings:
         return [], []
@@ -356,19 +321,10 @@ def _extract_from_llm_prompt(context: str, surface: str, result) -> tuple[list, 
             temperature=0.0,
         )
         raw = response["choices"][0]["message"]["content"].strip()
-        # Parse "1,3" or "1, 3" or "1 3" robustly
         indices = [int(x.strip()) - 1 for x in re.split(r"[,\s]+", raw) if x.strip().isdigit()]
         indices = [i for i in indices if 0 <= i < len(meanings)]
         if indices:
-            # maybe add random defintion in
-            # personally didnt like it so got rid of it
-            #
-            # all_other_indinces = [i for i in range(len(meanings)) if not i in indices]
-            # # add a random index at the end just for leaning some new stuff
-            # if all_other_indinces:
-            #     indices.append(random.choice(all_other_indinces))
             return [meanings[i] for i in indices], [poses[i] for i in indices]
-        # LLM returned nothing parseable — fall back
         return _extract_from_cutting(result=result)
     except Exception as e:
         print(f"  LLM gloss selection error: {e}")
@@ -376,12 +332,6 @@ def _extract_from_llm_prompt(context: str, surface: str, result) -> tuple[list, 
 
 
 def analyze_sentence(text: str) -> tuple[str, str]:
-    """Run MeCab + JMdict over the sentence in one pass.
-
-    Returns:
-        furigana_html  — full sentence as <ruby> tags (kanji only get rt)
-        word_gloss     — "surface=meaning · ..." for content words
-    """
     if _tagger is None:
         return text, ""
 
@@ -395,39 +345,33 @@ def analyze_sentence(text: str) -> tuple[str, str]:
             ruby_parts.append(surface)
             continue
 
-        # MeCab UniDic feature: reading is in field index 9 (katakana)
         try:
-            reading_kata = word.feature.kana  # works with unidic-lite
+            reading_kata = word.feature.kana
         except AttributeError:
             reading_kata = None
 
-        # Build ruby markup — only annotate tokens that contain kanji
         if reading_kata and _has_kanji(surface):
             reading_hira = _kana_to_hiragana(reading_kata)
             ruby_parts.append(f"<ruby>{surface}<rt>{reading_hira}</rt></ruby>")
         else:
             ruby_parts.append(surface)
 
-        # Build word gloss — content words only, no duplicates
         pos = word.feature.pos1
         if pos in _SKIP_POS or surface in seen_gloss or not _has_kanji(surface) and len(surface) <= 1:
             continue
         seen_gloss.add(surface)
 
-        lemma = (word.feature.lemma or surface).split("-")[0]  # strip inflection suffix
+        lemma = (word.feature.lemma or surface).split("-")[0]
         result = None
         if _jmd is not None:
             result = _jmd.lookup(lemma) or _jmd.lookup(surface)
 
         if result and result.entries:
             meanings, poses = _extract_from_llm_prompt(context=text, surface=surface, result=result)
-            
             formatted_meanings = []
-
             for i, sense_meaning in enumerate(meanings, 1):
                 pos_for_sense = poses[i - 1]
                 formatted_meanings.append(f"{i}) {sense_meaning} - {pos_for_sense}")
-
             if formatted_meanings:
                 gloss_pairs.append(f"{surface}:<br>" + "<br>".join(formatted_meanings))
 
@@ -465,18 +409,15 @@ def check_ffmpeg():
         sys.exit(1)
 
 
-def check_input_file(path: str):
-    p = Path(path)
-    if not p.exists():
-        print(f"File not found: {p.resolve()}")
-        sys.exit(1)
-    print(f"Found: {p.resolve()}  ({p.stat().st_size // 1024} KB)")
+# ── Card model ────────────────────────────────────────────────────────────────
 
-
-MODEL_ID = 1_234_567_893   # bumped so Anki treats this as a new model
+MODEL_ID = 1_234_567_894   # bumped — new field added (TTSAudio)
 DECK_ID  = 9_876_543_210
 
-CARD_CSS = GOOGLE_FONTS_CSS + """
+# Build font CSS from local files — no Google Fonts calls at card render time
+FONT_FACE_CSS = build_font_face_css(FONTS_DIR)
+
+CARD_CSS = FONT_FACE_CSS + """
 
 .card {
   font-size: 24px;
@@ -493,7 +434,7 @@ CARD_CSS = GOOGLE_FONTS_CSS + """
 .jp-furigana {
   font-size: 26px;
   margin-bottom: 10px;
-  line-height: 2.2;   /* extra space so furigana doesn't overlap */
+  line-height: 2.2;
 }
 ruby rt {
   font-size: 0.45em;
@@ -555,15 +496,16 @@ CARD_MODEL = genanki.Model(
     "Japanese Video Cards",
     fields=[
         {"name": "Text"},           # raw Japanese (front)
-        {"name": "Audio"},
+        {"name": "Audio"},          # Japanese clip audio
         {"name": "Image"},
-        {"name": "Translation"},    # full sentence from opus-mt
-        {"name": "Furigana"},       # HTML <ruby> markup for back only
-        {"name": "WordGloss"},      # token=meaning · token=meaning
+        {"name": "Translation"},    # English translation text
+        {"name": "TTSAudio"},       # English TTS audio
+        {"name": "Furigana"},       # HTML <ruby> markup
+        {"name": "WordGloss"},
         {"name": "TimeCode"},
-        {"name": "FontName"},       # rotated per card
+        {"name": "FontName"},
         {"name": "Source"},
-        {"name": "Notes"},          # blank — fill in manually
+        {"name": "Notes"},
     ],
     templates=[
         {
@@ -585,6 +527,7 @@ CARD_MODEL = genanki.Model(
                 "{{#Translation}}\n"
                 "<div class=\"translation\">{{Translation}}</div>\n"
                 "{{/Translation}}\n"
+                "{{TTSAudio}}\n"   # plays automatically on card flip
                 "\n"
                 "{{#WordGloss}}\n"
                 "<div class=\"gloss-label\">Word by word</div>\n"
@@ -604,7 +547,6 @@ CARD_MODEL = genanki.Model(
 
 
 def find_pairs(directory: Path) -> list[tuple[Path, Path]]:
-    """Find all .mp4/.mp3 files that have a matching .vtt of the same stem."""
     pairs = []
     for media in sorted(directory.iterdir()):
         if media.suffix.lower() not in (".mp4", ".mp3"):
@@ -617,10 +559,8 @@ def find_pairs(directory: Path) -> list[tuple[Path, Path]]:
     return pairs
 
 def already_processed(directory: Path) -> set[str]:
-    processed = set()
-    for media in sorted(directory.iterdir()):
-        processed.add(media.name)
-    return processed
+    return {media.name for media in sorted(directory.iterdir())}
+
 
 def process_file(
     media_path: Path,
@@ -632,18 +572,14 @@ def process_file(
     do_sentence: bool,
     do_gloss: bool,
 ) -> None:
-    """Process one media+vtt pair, adding notes to deck and paths to all_media_files."""
-
     original_name = media_path.name
     is_mp3 = media_path.suffix.lower() == ".mp3"
 
-    # Copy to a safe ASCII temp name so ffmpeg doesn't choke on unicode filenames
-    safe_id   = uuid.uuid4().hex[:12]
-    safe_ext  = media_path.suffix.lower()
+    safe_id    = uuid.uuid4().hex[:12]
+    safe_ext   = media_path.suffix.lower()
     safe_media = Path(tmpdir) / f"media_{safe_id}{safe_ext}"
     safe_vtt   = Path(tmpdir) / f"vtt_{safe_id}.vtt"
 
-    import shutil
     shutil.copy2(media_path, safe_media)
     shutil.copy2(vtt_path,   safe_vtt)
 
@@ -664,18 +600,19 @@ def process_file(
                 print(f"      ≈ {chunk.word_gloss[:65]}")
 
     for chunk in chunks:
-        idx        = chunk.index
-        card_uuid  = uuid.uuid4().hex[:10]
+        idx       = chunk.index
+        card_uuid = uuid.uuid4().hex
 
         audio_fname = f"clip_{idx:04d}_{card_uuid}.mp3"
         image_fname = f"frame_{idx:04d}_{card_uuid}.jpg"
+        tts_fname   = f"tts_{idx:04d}_{card_uuid}.mp3"
         audio_path  = os.path.join(tmpdir, audio_fname)
         image_path  = os.path.join(tmpdir, image_fname)
+        tts_path    = os.path.join(tmpdir, tts_fname)
 
         print(f"    [{idx+1}/{len(chunks)}] {chunk.start:.1f}s-{chunk.end:.1f}s  {chunk.text[:35]}")
 
         if is_mp3:
-            # mp3: extract audio slice only (no video frame)
             audio_ok = extract_audio(str(safe_media), chunk.start, chunk.end, audio_path)
             image_ok = False
         else:
@@ -683,8 +620,11 @@ def process_file(
             frame_ts = chunk.start + min(frame_offset, (chunk.end - chunk.start) * 0.5)
             image_ok = extract_frame(str(safe_media), frame_ts, image_path)
 
-        if not audio_ok: print(f"      Warning: audio extraction failed")
+        tts_ok = generate_tts(chunk.translation, tts_path) if chunk.translation else False
+
+        if not audio_ok:              print(f"      Warning: audio extraction failed")
         if not image_ok and not is_mp3: print(f"      Warning: frame extraction failed")
+        if not tts_ok:                print(f"      Warning: TTS generation failed (translation empty or error)")
 
         timecode = f"{int(chunk.start // 60):02d}:{chunk.start % 60:05.2f}"
 
@@ -693,31 +633,34 @@ def process_file(
             fields=[
                 chunk.text,
                 f"[sound:{audio_fname}]" if audio_ok else "",
-                f'<img src="{image_fname}">' if image_ok else "",
+                f'<img src="{image_fname}">'  if image_ok else "",
                 chunk.translation,
+                f"[sound:{tts_fname}]"   if tts_ok   else "",
                 chunk.furigana,
                 chunk.word_gloss,
                 timecode,
                 chunk.font,
-                original_name,   # source file
-                "",              # Notes — blank for manual entry
+                original_name,
+                "",   # Notes — blank for manual entry
             ],
         )
         deck.add_note(note)
 
         if audio_ok: all_media_files.append(audio_path)
         if image_ok: all_media_files.append(image_path)
+        if tts_ok:   all_media_files.append(tts_path)
 
-    # Clean up safe copies
     safe_media.unlink(missing_ok=True)
     safe_vtt.unlink(missing_ok=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Batch Anki deck generator from to_process/ directory")
-    parser.add_argument("--frame-offset",       type=float, default=1.0,
+    parser.add_argument("--frame-offset", type=float, default=1.0,
                         help="Seconds after chunk start to grab frame (default: 1.0)")
-    parser.add_argument("--deck-name",          default="Japanese Video Deck")
+    parser.add_argument("--deck-name",   default="Japanese Video Deck")
+    parser.add_argument("--tts-voice",   default="af_heart",
+                        help="Kokoro voice (default: af_heart). Others: af_bella, am_adam, bf_emma, bm_george")
     args = parser.parse_args()
 
     check_ffmpeg()
@@ -730,27 +673,34 @@ def main():
     print(f"Found {len(pairs)} pair(s) to process:")
     for media, vtt in pairs:
         print(f"  {media.name}  +  {vtt.name}")
-    
+
     if not setup_sentence_translator():
-        raise ValueError("Failed to set up sentence translator)")
+        raise ValueError("Failed to set up sentence translator")
     if not setup_word_glosser():
         raise ValueError("Failed to set up word glosser")
+    if not setup_tts():
+        raise ValueError("Failed to set up TTS")
+
+    # Bundle local font files into every package
+    font_files = list(FONTS_DIR.glob("*.ttf")) if FONTS_DIR.exists() else []
+    if not font_files:
+        print("  Warning: no font files to bundle — cards will fall back to system fonts.")
 
     do_sentence = True
     do_gloss    = True
     deck        = genanki.Deck(DECK_ID, args.deck_name)
-    media_files = []
+    media_files = [str(f) for f in font_files]   # fonts go in every package
+
     already_processed_names = already_processed(PROCESSED_DIR)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, (media_path, vtt_path) in enumerate(pairs):
             if media_path.name in already_processed_names:
                 print(f"{media_path.name} already processed. Skipping.")
                 continue
             already_processed_names.add(media_path.name)
-            # unique name
+
             output = f"output_{uuid.uuid4()}.apkg"
-            if Path(output).exists():
-                raise ValueError("how")
             print(f"\n{'='*60}")
             print(f"Processing ({i + 1}/{len(pairs)}): {media_path.name}")
             try:
@@ -764,16 +714,14 @@ def main():
                 pkg = genanki.Package(deck)
                 pkg.media_files = media_files
                 pkg.write_to_file(output)
-                # Move source files to processed/
-                import shutil
+
                 shutil.move(str(media_path), PROCESSED_DIR / media_path.name)
                 shutil.move(str(vtt_path),   PROCESSED_DIR / vtt_path.name)
-                print(f"  Moved to {PROCESSED_DIR}/")
+                print(f"  Moved source files to {PROCESSED_DIR}/")
+                print(f"  Done: {output}")
             except Exception as e:
                 print(f"  ERROR processing {media_path.name}: {e}")
                 import traceback; traceback.print_exc()
-
-    print(f"\nDone! Import {output} into Anki.")
 
 
 if __name__ == "__main__":
