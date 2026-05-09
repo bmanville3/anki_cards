@@ -37,6 +37,13 @@ else
     echo "Kokoro voices already exist, skipping."
 fi
 
+mkdir -p ./yomitan-jlpt-vocab
+for i in 1 2 3 4 5; do
+    curl -L --fail -o ./yomitan-jlpt-vocab/term_meta_bank_${i}.json \
+      "https://raw.githubusercontent.com/stephenmk/yomitan-jlpt-vocab/main/yomitan-jlpt-vocab/term_meta_bank_${i}.json" \
+      || echo "ERROR: failed to download term_meta_bank_${i}.json"
+done
+
 mkdir -p ./fonts
 
 # Download each font family zip and extract just the ttf files

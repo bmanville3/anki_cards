@@ -2,3 +2,6 @@ venv/
 fonts/
 processed/
 to_process/
+jlpt_words.json
+output_*
+yomitan-jlpt-vocab/

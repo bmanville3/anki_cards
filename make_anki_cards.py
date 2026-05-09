@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -29,8 +30,8 @@ if not PROCESSED_DIR.is_dir():
     raise ValueError(f"Please make sure {PROCESSED_DIR} is a dir")
 
 FONTS_DIR = Path("./fonts")
+JLPT_DATA_DIR = Path("./yomitan-jlpt-vocab")  # folder containing the bank files
 
-# Japanese fonts - rotated per card.
 JAPANESE_FONTS = [
     "NotoSansJP-Regular",
     "NotoSerifJP-Regular",
@@ -45,7 +46,6 @@ JAPANESE_FONTS = [
 ]
 
 def build_font_face_css(fonts_dir: Path) -> str:
-    """Build @font-face blocks for every .ttf in fonts_dir."""
     if not fonts_dir.exists():
         print(f"  Warning: {fonts_dir} not found — no local fonts will be embedded.")
         return ""
@@ -60,15 +60,140 @@ def build_font_face_css(fonts_dir: Path) -> str:
     return "\n".join(css_blocks)
 
 
+# ── POS → CSS class mapping ───────────────────────────────────────────────────
+# JMdict POS tags are verbose English strings like "Ichidan verb", "noun", etc.
+# We bucket them into a handful of colour classes.
+
+def _pos_to_class(pos_str: str) -> str:
+    p = pos_str.lower()
+    if any(x in p for x in ("verb", "vt", "vi", "vs", "vk", "v1", "v5")):
+        return "pos-verb"
+    if any(x in p for x in ("noun", "counter", "temporal")):
+        return "pos-noun"
+    if any(x in p for x in ("adjective", "adj")):
+        return "pos-adj"
+    if any(x in p for x in ("adverb", "adv")):
+        return "pos-adv"
+    if any(x in p for x in ("expression", "idiomatic")):
+        return "pos-expr"
+    return "pos-other"
+
+
+# ── JLPT lookup ───────────────────────────────────────────────────────────────
+# jamdict stores JLPT levels on KanjiElement and KanaElement via .jlpt.
+# We grab the highest (most beginner-friendly = highest number) level found.
+
+def _load_jlpt_data(directory: Path) -> dict[str, int]:
+    """Returns {word: jlpt_level} built from term_meta_bank_*.json files."""
+    mapping = {}
+    files = sorted(directory.glob("term_meta_bank_*.json"))
+    if not files:
+        print(f"  Warning: no term_meta_bank_*.json files found in {directory} — JLPT badges disabled.")
+        return {}
+    for f in files:
+        try:
+            entries = json.loads(f.read_text(encoding="utf-8"))
+            for entry in entries:
+                if not (isinstance(entry, list) and len(entry) >= 3):
+                    continue
+                word = entry[0]
+                meta = entry[2]
+                display = meta.get("frequency", {}).get("displayValue", "")
+                if display.startswith("N") and display[1:].isdigit():
+                    level = int(display[1:])
+                    if word not in mapping or level > mapping[word]:
+                        mapping[word] = level
+        except Exception as e:
+            print(f"  Failed to load {f.name}: {e}")
+    print(f"  JLPT data loaded: {len(mapping)} entries.")
+    return mapping
+
+
+_JLPT_MAP: dict[str, int] = _load_jlpt_data(JLPT_DATA_DIR)
+
+
+def _jlpt_for_result(result) -> str:
+    if not _JLPT_MAP:
+        return ""
+    best = None
+    for entry in result.entries:
+        for form in list(entry.kanji_forms) + list(entry.kana_forms):
+            level = _JLPT_MAP.get(form.text)
+            if level is not None:
+                if best is None or level > best:
+                    best = level
+    return f"N{best}" if best is not None else ""
+
+# ── Pitch accent ──────────────────────────────────────────────────────────────
+# UniDic's aType field gives the accent nucleus position as a string integer.
+#   0  = 平板 heiban  (flat — rises after mora 1, never drops)
+#   1  = 頭高 atamadaka (high on mora 1, drops after)
+#   2+ = 中高/尾高 (rises to mora 2, drops after mora N)
+#
+# We render it as coloured mora spans with a ↘ drop marker.
+
+def _kata_to_moras(kana: str) -> list[str]:
+    SMALL = set("ァィゥェォャュョヮヵヶぁぃぅぇぉゃゅょゎ")  # both kata and hira small
+    moras, i = [], 0
+    while i < len(kana):
+        if i + 1 < len(kana) and kana[i + 1] in SMALL:
+            moras.append(kana[i:i+2])
+            i += 2
+        else:
+            moras.append(kana[i])
+            i += 1
+    return moras
+
+
+def _pitch_html(reading_kata: str, accent_type: str) -> str:
+    if not reading_kata or not accent_type:
+        return ""
+    try:
+        n = int(accent_type.split(",")[0])  # just take the first variant
+    except ValueError:
+        return ""
+
+    moras = _kata_to_moras(reading_kata)
+    if not moras:
+        return ""
+
+    total = len(moras)
+    parts = []
+    for i, mora in enumerate(moras):
+        mora_pos = i + 1  # 1-indexed
+
+        if n == 0:
+            high = (mora_pos > 1)       # heiban: low then high throughout
+        elif n == 1:
+            high = (mora_pos == 1)      # atamadaka: only mora 1 is high
+        else:
+            high = (2 <= mora_pos <= n) # nakadaka/odaka
+
+        cls = "pa-high" if high else "pa-low"
+        parts.append(f'<span class="{cls}">{mora}</span>')
+
+        # Drop marker appears after the nucleus mora (not for heiban)
+        if n != 0 and mora_pos == n:
+            parts.append('<span class="pa-drop">↘</span>')
+
+    pattern_label = "平板" if n == 0 else f"型{n}"
+    return (
+        f'<span class="pa-wrap">'
+        f'{"".join(parts)}'
+        f'<span class="pa-label">{pattern_label}</span>'
+        f'</span>'
+    )
+
+
 @dataclass
 class Chunk:
     index: int
     start: float
     end: float
     text: str
-    translation: str = ""   # full sentence MT
-    word_gloss: str = ""    # token=meaning · token=meaning
-    furigana: str = ""      # HTML <ruby> markup for back of card
+    translation: str = ""
+    word_gloss: str = ""
+    furigana: str = ""
     font: str = ""
 
 
@@ -116,7 +241,7 @@ def setup_sentence_translator() -> bool:
         _llm = Llama(
             model_path=MODEL_PATH,
             n_ctx=2048,
-            n_gpu_layers=-1,   # offload everything to Metal GPU
+            n_gpu_layers=-1,
             verbose=False,
         )
         print("  LLM translation model ready.")
@@ -185,13 +310,11 @@ def setup_tts() -> bool:
 
 
 def generate_tts(text: str, out_path: str, voice: str = "af_heart") -> bool:
-    """Synthesize English text to an mp3 file. Returns True on success."""
     if _kokoro is None or not text.strip():
         return False
     try:
         import soundfile as sf
         samples, sample_rate = _kokoro.create(text, voice=voice, speed=1.0, lang="en-us")
-        # soundfile writes wav; ffmpeg converts to mp3 so Anki handles it fine
         wav_path = out_path.replace(".mp3", "_tts_tmp.wav")
         sf.write(wav_path, samples, sample_rate)
         r = subprocess.run(
@@ -243,16 +366,15 @@ def setup_word_glosser() -> bool:
 
 
 _SKIP_POS = {
-    "助詞",      # particles
-    "助動詞",    # auxiliary verbs
-    "記号",      # punctuation / symbols
-    "補助記号",  # supplementary symbols
-    "空白",      # whitespace
+    "助詞",
+    "助動詞",
+    "記号",
+    "補助記号",
+    "空白",
 }
 
 def _has_kanji(s: str) -> bool:
     return any('\u4e00' <= c <= '\u9fff' or '\u3400' <= c <= '\u4dbf' for c in s)
-
 
 def _kana_to_hiragana(s: str) -> str:
     return "".join(
@@ -262,8 +384,7 @@ def _kana_to_hiragana(s: str) -> str:
 
 def _extract_from_cutting(result) -> tuple[list, list]:
     senses = [s for e in result.entries[:MAX_ENTRIES] for s in e.senses]
-    meanings = []
-    poses = []
+    meanings, poses = [], []
     for sense in senses[:MAX_SENSES]:
         glosses = [g.text for g in sense.gloss[:MAX_GLOSSES_PER_SENSE]]
         if glosses:
@@ -275,20 +396,18 @@ _GLOSS_SELECTION_SYSTEM = (
     "You are a Japanese dictionary assistant. "
     "You will be given a Japanese paragraph, a word, and a numbered list of its dictionary definitions. "
     "Return ONLY a comma-separated list of the numbers of the most relevant and common definitions — "
-    "If the word has an extremely common definition outside of the context, return the context definition number(s) and the very common definition number(s) "
-    "However, bias toward returning the context definition number(s) "
+    "If the word has an extremely common definition outside of the context, return the context definition number(s) and the very common definition number(s). "
+    "However, bias toward returning the context definition number(s). "
     "If multiple definitions could fit the sentence, return each definition. "
-    "Make sure you respond in a comma separate list of numbers like a csv "
-    "no explanations, no other text. Example output: 1,3 "
+    "Make sure you respond in a comma separated list of numbers like a csv. "
+    "no explanations, no other text. Example output: 1,3"
 )
 
 def _extract_from_llm_prompt(context: str, surface: str, result) -> tuple[list, list]:
     if _llm is None:
         return _extract_from_cutting(result=result)
     senses = [s for e in result.entries for s in e.senses]
-    seen = set()
-    meanings = []
-    poses = []
+    seen, meanings, poses = set(), [], []
     for sense in senses:
         glosses = [g.text for g in sense.gloss]
         if glosses:
@@ -332,6 +451,11 @@ def _extract_from_llm_prompt(context: str, surface: str, result) -> tuple[list, 
 
 
 def analyze_sentence(text: str) -> tuple[str, str]:
+    """
+    Returns:
+        furigana_html — sentence marked up with <ruby> tags
+        word_gloss    — HTML with POS colours, JLPT badges, pitch accent
+    """
     if _tagger is None:
         return text, ""
 
@@ -350,6 +474,14 @@ def analyze_sentence(text: str) -> tuple[str, str]:
         except AttributeError:
             reading_kata = None
 
+        # aType: pitch accent nucleus index from UniDic; "*" means unknown
+        try:
+            accent_type = word.feature.aType
+            if accent_type == "*":
+                accent_type = ""
+        except AttributeError:
+            accent_type = ""
+
         if reading_kata and _has_kanji(surface):
             reading_hira = _kana_to_hiragana(reading_kata)
             ruby_parts.append(f"<ruby>{surface}<rt>{reading_hira}</rt></ruby>")
@@ -357,7 +489,7 @@ def analyze_sentence(text: str) -> tuple[str, str]:
             ruby_parts.append(surface)
 
         pos = word.feature.pos1
-        if pos in _SKIP_POS or surface in seen_gloss or not _has_kanji(surface) and len(surface) <= 1:
+        if pos in _SKIP_POS or surface in seen_gloss or (not _has_kanji(surface) and len(surface) <= 1):
             continue
         seen_gloss.add(surface)
 
@@ -368,12 +500,29 @@ def analyze_sentence(text: str) -> tuple[str, str]:
 
         if result and result.entries:
             meanings, poses = _extract_from_llm_prompt(context=text, surface=surface, result=result)
-            formatted_meanings = []
-            for i, sense_meaning in enumerate(meanings, 1):
-                pos_for_sense = poses[i - 1]
-                formatted_meanings.append(f"{i}) {sense_meaning} - {pos_for_sense}")
-            if formatted_meanings:
-                gloss_pairs.append(f"{surface}:<br>" + "<br>".join(formatted_meanings))
+            jlpt       = _jlpt_for_result(result)
+            pitch_html = _pitch_html(
+                _kana_to_hiragana(reading_kata) if reading_kata else "",
+                accent_type
+            )
+
+            if meanings:
+                jlpt_span  = f'<span class="jlpt-badge jlpt-{jlpt}">{jlpt}</span>' if jlpt else ""
+                pitch_span = f'<span class="pa-container">{pitch_html}</span>'       if pitch_html else ""
+
+                header = f'<span class="gloss-word">{surface}</span>{jlpt_span}{pitch_span}'
+                lines  = [header]
+
+                for i, sense_meaning in enumerate(meanings, 1):
+                    pos_str   = poses[i - 1]
+                    pos_class = _pos_to_class(pos_str)
+                    lines.append(
+                        f'<span class="{pos_class} gloss-line">'
+                        f'{i}) {sense_meaning}'
+                        f'<span class="pos-tag"> [{pos_str}]</span>'
+                        f'</span>'
+                    )
+                gloss_pairs.append("<br>".join(lines))
 
     furigana_html = "".join(ruby_parts)
     word_gloss    = "<br><br>".join(gloss_pairs)
@@ -411,10 +560,9 @@ def check_ffmpeg():
 
 # ── Card model ────────────────────────────────────────────────────────────────
 
-MODEL_ID = 1_234_567_894   # bumped — new field added (TTSAudio)
+MODEL_ID = 1_234_567_895
 DECK_ID  = 9_876_543_210
 
-# Build font CSS from local files — no Google Fonts calls at card render time
 FONT_FACE_CSS = build_font_face_css(FONTS_DIR)
 
 CARD_CSS = FONT_FACE_CSS + """
@@ -470,10 +618,87 @@ hr {
 }
 .word-gloss {
   font-size: 14px;
-  color: #89b4fa;
+  color: #cdd6f4;
   margin-top: 4px;
-  line-height: 1.9;
+  line-height: 2.0;
+  text-align: left;
+  display: inline-block;
 }
+.gloss-word {
+  font-size: 15px;
+  font-weight: bold;
+  color: #cdd6f4;
+  padding-right: 6px;
+}
+.gloss-line {
+  display: block;
+  margin-left: 8px;
+}
+.pos-tag {
+  font-size: 11px;
+  opacity: 0.6;
+}
+
+/* ── POS colours ── */
+.pos-verb  { color: #89dceb; }   /* teal   — verbs */
+.pos-noun  { color: #cdd6f4; }   /* white  — nouns */
+.pos-adj   { color: #a6e3a1; }   /* green  — adjectives */
+.pos-adv   { color: #f9e2af; }   /* yellow — adverbs */
+.pos-expr  { color: #cba6f7; }   /* purple — expressions/idioms */
+.pos-other { color: #bac2de; }   /* muted  — everything else */
+
+/* ── JLPT badges ── */
+.jlpt-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: bold;
+  padding: 1px 5px;
+  border-radius: 4px;
+  margin-left: 5px;
+  vertical-align: middle;
+  color: #1e1e2e;
+}
+.jlpt-N5 { background: #a6e3a1; }   /* green  — easiest */
+.jlpt-N4 { background: #89dceb; }   /* teal */
+.jlpt-N3 { background: #f9e2af; }   /* yellow */
+.jlpt-N2 { background: #fab387; }   /* orange */
+.jlpt-N1 { background: #f38ba8; }   /* red    — hardest */
+
+/* ── Pitch accent ── */
+.pa-container {
+  display: inline-block;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.pa-wrap {
+  display: inline-flex;
+  align-items: flex-end;
+  font-size: 12px;
+  gap: 0;
+}
+.pa-high {
+  color: #89b4fa;
+  border-top: 2px solid #89b4fa;
+  padding: 0 1px;
+}
+.pa-low {
+  color: #89b4fa;
+  border-top: 2px solid transparent;
+  padding: 0 1px;
+}
+.pa-drop {
+  color: #f38ba8;
+  font-size: 10px;
+  margin: 0 1px;
+  align-self: center;
+}
+.pa-label {
+  font-size: 10px;
+  color: #585b70;
+  margin-left: 4px;
+  align-self: center;
+}
+
 .source-name {
   font-size: 15px;
   color: #bac2de;
@@ -495,12 +720,12 @@ CARD_MODEL = genanki.Model(
     MODEL_ID,
     "Japanese Video Cards",
     fields=[
-        {"name": "Text"},           # raw Japanese (front)
-        {"name": "Audio"},          # Japanese clip audio
+        {"name": "Text"},
+        {"name": "Audio"},
         {"name": "Image"},
-        {"name": "Translation"},    # English translation text
-        {"name": "TTSAudio"},       # English TTS audio
-        {"name": "Furigana"},       # HTML <ruby> markup
+        {"name": "Translation"},
+        {"name": "TTSAudio"},
+        {"name": "Furigana"},
         {"name": "WordGloss"},
         {"name": "TimeCode"},
         {"name": "FontName"},
@@ -518,7 +743,6 @@ CARD_MODEL = genanki.Model(
             "afmt": (
                 "{{FrontSide}}\n"
                 "<hr>\n"
-                "<div class=\"frame-wrap\">{{Image}}</div>\n"
                 "\n"
                 "{{#Furigana}}\n"
                 "<div class=\"jp-furigana\" style=\"font-family: '{{FontName}}', sans-serif;\">{{Furigana}}</div>\n"
@@ -527,7 +751,9 @@ CARD_MODEL = genanki.Model(
                 "{{#Translation}}\n"
                 "<div class=\"translation\">{{Translation}}</div>\n"
                 "{{/Translation}}\n"
-                "{{TTSAudio}}\n"   # plays automatically on card flip
+                "{{TTSAudio}}\n"
+                "\n"
+                "<div class=\"frame-wrap\">{{Image}}</div>\n"
                 "\n"
                 "{{#WordGloss}}\n"
                 "<div class=\"gloss-label\">Word by word</div>\n"
@@ -571,6 +797,7 @@ def process_file(
     frame_offset: float,
     do_sentence: bool,
     do_gloss: bool,
+    tts_voice: str,
 ) -> None:
     original_name = media_path.name
     is_mp3 = media_path.suffix.lower() == ".mp3"
@@ -597,7 +824,8 @@ def process_file(
             if chunk.translation:
                 print(f"      → {chunk.translation[:65]}")
             if chunk.word_gloss:
-                print(f"      ≈ {chunk.word_gloss[:65]}")
+                preview = re.sub(r"<[^>]+>", "", chunk.word_gloss)
+                print(f"      ≈ {preview[:65]}")
 
     for chunk in chunks:
         idx       = chunk.index
@@ -620,11 +848,11 @@ def process_file(
             frame_ts = chunk.start + min(frame_offset, (chunk.end - chunk.start) * 0.5)
             image_ok = extract_frame(str(safe_media), frame_ts, image_path)
 
-        tts_ok = generate_tts(chunk.translation, tts_path) if chunk.translation else False
+        tts_ok = generate_tts(chunk.translation, tts_path, voice=tts_voice) if chunk.translation else False
 
-        if not audio_ok:              print(f"      Warning: audio extraction failed")
+        if not audio_ok:                print(f"      Warning: audio extraction failed")
         if not image_ok and not is_mp3: print(f"      Warning: frame extraction failed")
-        if not tts_ok:                print(f"      Warning: TTS generation failed (translation empty or error)")
+        if not tts_ok:                  print(f"      Warning: TTS generation failed")
 
         timecode = f"{int(chunk.start // 60):02d}:{chunk.start % 60:05.2f}"
 
@@ -632,16 +860,16 @@ def process_file(
             model=CARD_MODEL,
             fields=[
                 chunk.text,
-                f"[sound:{audio_fname}]" if audio_ok else "",
-                f'<img src="{image_fname}">'  if image_ok else "",
+                f"[sound:{audio_fname}]"    if audio_ok else "",
+                f'<img src="{image_fname}">' if image_ok else "",
                 chunk.translation,
-                f"[sound:{tts_fname}]"   if tts_ok   else "",
+                f"[sound:{tts_fname}]"      if tts_ok   else "",
                 chunk.furigana,
                 chunk.word_gloss,
                 timecode,
                 chunk.font,
                 original_name,
-                "",   # Notes — blank for manual entry
+                "",
             ],
         )
         deck.add_note(note)
@@ -681,15 +909,12 @@ def main():
     if not setup_tts():
         raise ValueError("Failed to set up TTS")
 
-    # Bundle local font files into every package
     font_files = list(FONTS_DIR.glob("*.ttf")) if FONTS_DIR.exists() else []
     if not font_files:
         print("  Warning: no font files to bundle — cards will fall back to system fonts.")
 
     do_sentence = True
     do_gloss    = True
-    deck        = genanki.Deck(DECK_ID, args.deck_name)
-    media_files = [str(f) for f in font_files]   # fonts go in every package
 
     already_processed_names = already_processed(PROCESSED_DIR)
 
@@ -699,8 +924,10 @@ def main():
                 print(f"{media_path.name} already processed. Skipping.")
                 continue
             already_processed_names.add(media_path.name)
+            deck        = genanki.Deck(DECK_ID, args.deck_name)
+            media_files = [str(f) for f in font_files]
 
-            output = f"output_{uuid.uuid4()}.apkg"
+            output = f"output_{media_path.stem}.apkg"
             print(f"\n{'='*60}")
             print(f"Processing ({i + 1}/{len(pairs)}): {media_path.name}")
             try:
@@ -708,6 +935,7 @@ def main():
                     media_path, vtt_path,
                     deck, media_files, tmpdir,
                     args.frame_offset, do_sentence, do_gloss,
+                    tts_voice=args.tts_voice,
                 )
                 print(f"\n{'='*60}")
                 print(f"Writing {output} ...")
