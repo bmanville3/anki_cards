@@ -1,6 +1,10 @@
+import logging
 from typing import Iterable, Self
 
 from attr import define
+
+
+logger = logging.getLogger(__name__)
 
 
 @define
@@ -12,7 +16,8 @@ class RawChunk:
 
     def pretty_string(self) -> str:
         return f"\t- Start: {self.start} -> End: {self.end}\n\t- {self.index}): {self.subtitle_text}"
-    
+
+
 @define
 class FullContext:
     target_chunk: RawChunk
@@ -40,6 +45,7 @@ class FullContext:
             prompt += "\nHere is a list of subtitle chunks that occur after the target chunk"
             for chunk in self.next_chunks:
                 prompt += f"\n\n{chunk.pretty_string()}"
+        logger.debug("New full context prompt:\n%s", prompt)
         return prompt
 
     @classmethod
@@ -47,8 +53,12 @@ class FullContext:
         previous_chunks: list[RawChunk] = []
         target_chunk: RawChunk | None = None
         next_chunks: list[RawChunk] = []
+        seen_indices = set()
 
         for chunk in raw_chunks:
+            if chunk.index in seen_indices:
+                raise ValueError(f"{chunk.index} in seen indices. Was there a duplicate passed?")
+            seen_indices.add(chunk.index)
             if chunk.index < target_index:
                 previous_chunks.append(chunk)
             elif chunk.index == target_index:
@@ -64,6 +74,7 @@ class FullContext:
             previous_chunks=previous_chunks,
             next_chunks=next_chunks,
         )
+
 
 @define
 class Sense:
@@ -84,6 +95,7 @@ class SenseResult:
 
 @define
 class CompletedChunk(RawChunk):
-    translation: str
+    literal_translation: str
+    natural_translation: str
     word_gloss: list[SenseResult]
     furigana: str

@@ -2,7 +2,7 @@ import logging
 import re
 
 from src.common.types import FullContext, Sense, SenseResult
-from src.prompting.prompter import prompt_with_retries
+from src.prompting.prompter import PromptRequest, prompt_with_retries
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,8 @@ def _format_senses(word: str, senses: list[Sense]) -> str:
 
 
 def _build_select_prompt(context: FullContext, words_and_senses: list[tuple[str, list[Sense]]]) -> str:
-    prompt = f"Full Context: {context.get_chunking_context_prompt()}\n\n"
+    prompt = f"Full Context:\n{context.get_chunking_context_prompt()}\n\n"
+    prompt += f"Target Chunk:\n{context.target_chunk.pretty_string()}\n\n"
     for word, senses in words_and_senses:
         prompt += _format_senses(word, senses) + "\n\n"
     if len(words_and_senses) == 1:
@@ -61,11 +62,13 @@ def _build_select_prompt(context: FullContext, words_and_senses: list[tuple[str,
             "For each word, which definition numbers best fit the sentence?\n"
             "Respond with one line per word: 'word: numbers' or 'word: NONE'."
         )
+    logger.debug("New select prompt:\n%s", prompt)
     return prompt
 
 
 def _build_verify_prompt(context: FullContext, words_and_senses: list[tuple[str, list[Sense]]], selections: dict[str, list[int]]) -> str:
-    prompt = f"Full Context: {context.get_chunking_context_prompt()}\n\n"
+    prompt = f"Full Context:\n{context.get_chunking_context_prompt()}\n\n"
+    prompt += f"Target Chunk:\n{context.target_chunk.pretty_string()}\n\n"
     for word, senses in words_and_senses:
         chosen_indices = selections.get(word, [])
         chosen = [s for s in senses if s.index in chosen_indices]
@@ -78,15 +81,25 @@ def _build_verify_prompt(context: FullContext, words_and_senses: list[tuple[str,
             prompt += f"    {s.index + 1}) {s.meaning} [{s.pos}]\n"
         prompt += "\n"
     prompt += "Do you agree with all selections? Respond 'AGREE' or list disagreements as 'DISAGREE: word'."
+    logger.debug("New verify prompt:\n%s", prompt)
     return prompt
 
 
 def _build_custom_prompt(context: FullContext, word: str, senses: list[Sense]) -> str:
-    lines = ["Full Context:", context.get_chunking_context_prompt(), f"Word: {word}", "Provided definitions (all considered inadequate):"]
+    lines = [
+        "Full Context:",
+        context.get_chunking_context_prompt(),
+        "Target Chunk:",
+        context.target_chunk.pretty_string(),
+        f"Word: {word}",
+        "Provided definitions (all considered inadequate):"
+    ]
     for s in senses:
         lines.append(f"  {s.pretty_string()}")
     lines.append("\nWrite a short definition for this word as used in the sentence.")
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    logger.debug("New custom prompt:\n%s", prompt)
+    return prompt
 
 
 def _parse_single(raw: str, senses: list[Sense]) -> list[int] | None:
@@ -141,10 +154,11 @@ def _parse_verify(raw: str) -> list[str]:
 
 def _select_single(context: FullContext, word: str, senses: list[Sense]) -> SenseResult:
     prompt = _build_select_prompt(context, [(word, senses)])
-    raw = prompt_with_retries(
+    prompt_req = PromptRequest(
         system_prompt=_SELECT_SYSTEM,
         user_prompt=prompt,
     )
+    raw = prompt_with_retries(prompt_req)
     indices = _parse_single(raw, senses)
 
     if indices is not None:
@@ -152,28 +166,31 @@ def _select_single(context: FullContext, word: str, senses: list[Sense]) -> Sens
 
     logger.debug("No suitable sense found for %r — requesting custom definition", word)
     custom_prompt = _build_custom_prompt(context, word, senses)
-    custom_def = prompt_with_retries(
+    custom_req = PromptRequest(
         system_prompt=_CUSTOM_SYSTEM,
         user_prompt=custom_prompt,
     )
+    custom_def = prompt_with_retries(custom_req)
     return SenseResult(word=word, selected=[], custom_definition=custom_def or None)
 
 
 def _select_batch(context: FullContext, words_and_senses: list[tuple[str, list[Sense]]]) -> list[SenseResult]:
     select_prompt = _build_select_prompt(context, words_and_senses)
-    raw_select = prompt_with_retries(
+    select_req = PromptRequest(
         system_prompt=_SELECT_SYSTEM,
         user_prompt=select_prompt,
     )
+    raw_select = prompt_with_retries(select_req)
     selections = _parse_batch(raw_select, words_and_senses)
 
     verify_prompt = _build_verify_prompt(context, words_and_senses, {
         w: idxs for w, idxs in selections.items() if idxs is not None
     })
-    raw_verify = prompt_with_retries(
+    verify_req = PromptRequest(
         system_prompt=_VERIFY_SYSTEM,
         user_prompt=verify_prompt,
     )
+    raw_verify = prompt_with_retries(verify_req)
     disagreed = _parse_verify(raw_verify)
 
     if disagreed:

@@ -2,11 +2,22 @@
 Anki deck generator — integrated pipeline.
 
 Concurrency model:
-  - Per file, translation and sense-selection run in parallel thread pools
-    (both hit the vLLM server; GIL is released during HTTP I/O).
+  - Per file, translation (natural + literal) and sense-selection run in
+    parallel thread pools (both hit the vLLM server; GIL is released during
+    HTTP I/O).
   - TTS, audio extraction, and frame extraction run concurrently in a second
     thread pool during the card-generation pass.
   - Fish Audio S2 Pro is called via its local HTTP server (tools/api_server.py).
+
+Deck structure:
+  - A parent deck "Japanese Video Deck" is created (or reused across runs).
+  - Each video gets its own subdeck: "Japanese Video Deck::<video stem>".
+  - Within each subdeck cards are ordered chronologically:
+      sentence card  →  vocab card(s) for new words introduced in that sentence
+  - Vocab cards: JP word on front (cloned-voice TTS), EN definition on back
+    (neutral Kokoro TTS).  Words are de-duplicated across the whole video so
+    each word appears only once, anchored to the earliest sentence that
+    introduced it.
 """
 
 from __future__ import annotations
@@ -36,6 +47,7 @@ from src.common.types import RawChunk, FullContext, Sense, SenseResult, Complete
 from src.common.utils import server_available
 from src.prompting.translator import translate_sentence as _translate_sentence
 from src.prompting.sense_selector import select_senses
+from src.tts import build_tts_pair, TTSBackend
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_ENTRIES           = 10
@@ -44,11 +56,12 @@ MAX_GLOSSES_PER_SENSE = 2
 CONTEXT_PREV_WINDOW   = 40
 CONTEXT_NEXT_WINDOW   = 1
 
-# Thread pool sizes — translation and sense-selection are I/O-bound (HTTP to
-# vLLM), so more threads than CPU cores is fine. TTS + ffmpeg are also I/O /
-# subprocess-bound so the same logic applies.
-LLM_WORKERS = 8   # concurrent vLLM requests (translation + sense selection)
-MEDIA_WORKERS = 4  # concurrent TTS + ffmpeg jobs per card
+LLM_WORKERS   = 8
+MEDIA_WORKERS = 4
+
+# How many seconds of audio to extract from the media file to use as the
+# voice-cloning reference for Fish JP TTS.
+VOICE_CLONE_DURATION = 30.0
 
 TO_PROCESS_DIR = Path("./to_process")
 if not TO_PROCESS_DIR.exists() or not TO_PROCESS_DIR.is_dir():
@@ -73,6 +86,12 @@ JAPANESE_FONTS = [
     "ZenAntique-Regular",
     "ShipporiMincho-Regular",
 ]
+
+# Stable IDs — deck/model IDs must never change between runs or Anki will
+# treat them as new decks/models and duplicate cards.
+PARENT_DECK_ID = 9_876_543_210
+MODEL_ID       = 1_234_567_895
+VOCAB_MODEL_ID = 1_234_567_896   # separate model for vocab cards
 
 
 # ── Font CSS ──────────────────────────────────────────────────────────────────
@@ -336,8 +355,7 @@ def _tokenise_chunk(chunk: RawChunk, context: FullContext) -> _TokenisedChunk:
     """
     Pass 1 (CPU-only): tokenise with fugashi, build furigana ruby parts,
     collect (word, senses) candidates for LLM sense selection.
-    fugashi is not thread-safe, so this must be called from the main thread
-    or a single-threaded executor — we call it sequentially before parallelising.
+    fugashi is not thread-safe, so this must be called sequentially.
     """
     ruby_parts: list[str] = []
     words_and_senses: list[tuple[str, list[Sense]]] = []
@@ -440,54 +458,58 @@ def _render_gloss_html(tc: _TokenisedChunk, sense_results: list[SenseResult]) ->
     return furigana_html, word_gloss
 
 
-# ── TTS (Fish Audio S2 Pro) ───────────────────────────────────────────────────
+# ── Voice cloning helpers ─────────────────────────────────────────────────────
 
-FISH_TTS_URL        = "http://127.0.0.1:8080/v1/tts"
-FISH_HEALTH_URL     = "http://127.0.0.1:8080/v1/health"
-_fish_tts_available = False
+def extract_voice_reference(media_path: Path, out_path: str, duration: float = VOICE_CLONE_DURATION) -> bool:
+    """
+    Extract the first `duration` seconds of audio from the media file to use
+    as a Fish voice-cloning reference.  Returns True on success.
+    """
+    r = subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(media_path),
+            "-t", str(duration),
+            "-vn",
+            "-ar", "44100",
+            "-ac", "1",
+            "-q:a", "2",
+            out_path,
+        ],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        print(f"  ffmpeg voice-ref error: {r.stderr.decode(errors='replace')[-200:]}")
+    return r.returncode == 0
 
-# A shared httpx client with a connection pool — safe to use from multiple
-# threads and avoids re-establishing TCP connections on every TTS request.
-_fish_client = httpx.Client(timeout=60, limits=httpx.Limits(max_connections=MEDIA_WORKERS))
+
+# ── TTS helpers ───────────────────────────────────────────────────────────────
+
+# Built once per run in main(); None until then.
+_jp_tts:  TTSBackend | None = None
+_en_tts:  TTSBackend | None = None
 
 
-def setup_tts() -> bool:
-    global _fish_tts_available
+def setup_tts(jp_backend: str, en_backend: str) -> bool:
+    global _jp_tts, _en_tts
     try:
-        r = _fish_client.get(FISH_HEALTH_URL, timeout=3)
-        if r.status_code == 200 and r.json().get("status") == "ok":
-            _fish_tts_available = True
-            print("  TTS ready (Fish Audio S2 Pro).")
-            return True
-        print(f"  Fish Audio server unhealthy: {r.text}")
-        return False
-    except Exception as e:
-        print(f"  Fish Audio S2 Pro server not reachable at {FISH_TTS_URL}: {e}")
-        print(
-            "  Start it with: python tools/api_server.py "
-            "--llama-checkpoint-path checkpoints/s2-pro "
-            "--decoder-checkpoint-path checkpoints/s2-pro/codec.pth "
-            "--listen 0.0.0.0:8080 --half"
-        )
-        return False
-
-
-def generate_tts(text: str, out_path: str, voice: str = "") -> bool:
-    if not _fish_tts_available or not text.strip():
-        return False
-    try:
-        payload: dict = {"text": text, "format": "mp3", "streaming": False}
-        if voice:
-            payload["reference_id"] = voice
-        r = _fish_client.post(FISH_TTS_URL, json=payload)
-        if r.status_code != 200:
-            print(f"  TTS error {r.status_code}: {r.text[:200]}")
-            return False
-        Path(out_path).write_bytes(r.content)
+        _jp_tts, _en_tts = build_tts_pair(jp_backend, en_backend, media_workers=MEDIA_WORKERS)
         return True
-    except Exception as e:
-        print(f"  TTS error: {e}")
+    except RuntimeError as e:
+        print(f"  TTS setup failed: {e}")
         return False
+
+
+def generate_jp_tts(text: str, out_path: str) -> bool:
+    if _jp_tts is None or not text.strip():
+        return False
+    return _jp_tts.generate(text, out_path)
+
+
+def generate_en_tts(text: str, out_path: str) -> bool:
+    if _en_tts is None or not text.strip():
+        return False
+    return _en_tts.generate(text, out_path)
 
 
 # ── ffmpeg helpers ────────────────────────────────────────────────────────────
@@ -521,14 +543,11 @@ def check_ffmpeg() -> None:
         sys.exit(1)
 
 
-# ── Anki card model ───────────────────────────────────────────────────────────
-
-MODEL_ID = 1_234_567_895
-DECK_ID  = 9_876_543_210
+# ── Anki CSS ──────────────────────────────────────────────────────────────────
 
 FONT_FACE_CSS = build_font_face_css(FONTS_DIR)
 
-CARD_CSS = FONT_FACE_CSS + """
+_SHARED_CSS = FONT_FACE_CSS + """
 .card {
   font-size: 24px; text-align: center; background: #1e1e2e;
   color: #cdd6f4; padding: 24px 20px; line-height: 1.7;
@@ -578,16 +597,25 @@ hr { border: none; border-top: 1px solid #313244; margin: 16px 0; }
   font-size: 15px; color: #bac2de; min-height: 1.4em;
   border-bottom: 1px dashed #45475a; margin-top: 4px; padding-bottom: 4px;
 }
+.vocab-word { font-size: 38px; font-weight: bold; margin-bottom: 8px; }
+.vocab-reading { font-size: 20px; color: #89b4fa; margin-bottom: 6px; }
+.vocab-meaning { font-size: 18px; color: #a6e3a1; font-style: italic; margin-bottom: 10px; }
+.vocab-pos { font-size: 12px; color: #585b70; margin-bottom: 4px; }
+.vocab-label { font-size: 11px; color: #585b70; text-transform: uppercase;
+  letter-spacing: 0.08em; margin-top: 14px; }
 """
 
-CARD_MODEL = genanki.Model(
+# ── Anki card models ──────────────────────────────────────────────────────────
+
+SENTENCE_MODEL = genanki.Model(
     MODEL_ID,
-    "Japanese Video Cards",
+    "Japanese Video Sentence Cards",
     fields=[
         {"name": "Text"},
         {"name": "Audio"},
         {"name": "Image"},
-        {"name": "Translation"},
+        {"name": "NaturalTranslation"},
+        {"name": "LiteralTranslation"},
         {"name": "TTSAudio"},
         {"name": "Furigana"},
         {"name": "WordGloss"},
@@ -597,7 +625,7 @@ CARD_MODEL = genanki.Model(
         {"name": "Notes"},
     ],
     templates=[{
-        "name": "Card 1",
+        "name": "Sentence Card",
         "qfmt": (
             "<div class=\"jp-text\" style=\"font-family: '{{FontName}}', sans-serif;\">{{Text}}</div>\n"
             "{{Audio}}\n"
@@ -608,42 +636,178 @@ CARD_MODEL = genanki.Model(
             "{{#Furigana}}\n"
             "<div class=\"jp-furigana\" style=\"font-family: '{{FontName}}', sans-serif;\">{{Furigana}}</div>\n"
             "{{/Furigana}}\n"
-            "{{#Translation}}\n"
-            "<div class=\"translation\">{{Translation}}</div>\n"
-            "{{/Translation}}\n"
+            "{{#NaturalTranslation}}\n"
+            "<div class=\"translation\">{{NaturalTranslation}}</div>\n"
+            "{{/NaturalTranslation}}\n"
             "{{TTSAudio}}\n"
             "<div class=\"frame-wrap\">{{Image}}</div>\n"
             "{{#WordGloss}}\n"
             "<div class=\"gloss-label\">Word by word</div>\n"
             "<div class=\"word-gloss\">{{WordGloss}}</div>\n"
             "{{/WordGloss}}\n"
+            "{{#LiteralTranslation}}\n"
+            "<div class=\"gloss-label\">Literal</div>\n"
+            "<div class=\"translation\" style=\"color:#cba6f7;\">{{LiteralTranslation}}</div>\n"
+            "{{/LiteralTranslation}}\n"
             "<div class=\"notes-label\">Notes</div>\n"
             "<div class=\"notes\">{{Notes}}</div>\n"
             "<div class=\"source-label\">Source</div>\n"
             "<div class=\"source-name\">{{Source}}</div>\n"
         ),
     }],
-    css=CARD_CSS,
+    css=_SHARED_CSS,
+)
+
+VOCAB_MODEL = genanki.Model(
+    VOCAB_MODEL_ID,
+    "Japanese Video Vocab Cards",
+    fields=[
+        {"name": "Word"},          # JP word (shown on front)
+        {"name": "WordAudio"},     # JP TTS audio tag
+        {"name": "Reading"},       # hiragana reading
+        {"name": "Meaning"},       # plain-text meanings for TTS + display
+        {"name": "MeaningAudio"},  # EN TTS audio tag
+        {"name": "WordGloss"},     # full HTML gloss (same as sentence back)
+        {"name": "JLPT"},
+        {"name": "FontName"},
+        {"name": "Source"},
+    ],
+    templates=[{
+        "name": "Vocab Card",
+        "qfmt": (
+            "<div class=\"vocab-word\" style=\"font-family: '{{FontName}}', sans-serif;\">{{Word}}</div>\n"
+            "{{WordAudio}}\n"
+        ),
+        "afmt": (
+            "{{FrontSide}}\n<hr>\n"
+            "{{#Reading}}"
+            "<div class=\"vocab-reading\">{{Reading}}</div>\n"
+            "{{/Reading}}"
+            "<div class=\"vocab-meaning\">{{Meaning}}</div>\n"
+            "{{MeaningAudio}}\n"
+            "{{#WordGloss}}\n"
+            "<div class=\"vocab-label\">Full breakdown</div>\n"
+            "<div class=\"word-gloss\">{{WordGloss}}</div>\n"
+            "{{/WordGloss}}\n"
+            "{{#JLPT}}<div class=\"jlpt-badge jlpt-{{JLPT}}\">{{JLPT}}</div>{{/JLPT}}\n"
+            "<div class=\"source-label\">Source</div>\n"
+            "<div class=\"source-name\">{{Source}}</div>\n"
+        ),
+    }],
+    css=_SHARED_CSS,
 )
 
 
-# ── File discovery ────────────────────────────────────────────────────────────
+# ── Vocab card helpers ────────────────────────────────────────────────────────
 
-def find_pairs(directory: Path) -> list[tuple[Path, Path]]:
-    pairs = []
-    for media in sorted(directory.iterdir()):
-        if media.suffix.lower() not in (".mp4", ".mp3"):
+@dataclass
+class VocabCard:
+    """All data needed to build one vocab Anki note."""
+    word: str
+    reading: str          # hiragana
+    meaning_plain: str    # clean English string — used for EN TTS + display
+    gloss_html: str       # full HTML gloss block (same style as sentence back)
+    jlpt: str
+    font_name: str
+    source: str           # video filename
+
+
+@dataclass
+class _WordAccumulator:
+    """
+    Accumulates every distinct sense selected for one word across the whole
+    video, so the final vocab card reflects all usages, not just the first.
+    """
+    word: str
+    first_chunk_index: int          # card is anchored here for ordering
+    meta: dict                      # reading_kata, accent_type, result
+    # Each entry is (meaning, pos) — kept ordered, deduped by this set:
+    seen_sense_keys: set[tuple[str, str]] = field(default_factory=set)
+    meanings: list[str]             = field(default_factory=list)
+    poses:    list[str]             = field(default_factory=list)
+
+
+def _accumulate_senses(
+    tc: _TokenisedChunk,
+    sense_results: list[SenseResult],
+    accumulator: dict[str, _WordAccumulator],
+) -> None:
+    """
+    For every word in this chunk's sense results, add any new (meaning, pos)
+    pairs to the accumulator.  Records the first chunk index where the word
+    appeared.  Call this once per chunk in forward order.
+    """
+    sense_map = {sr.word: sr for sr in sense_results}
+
+    for surface, _ in tc.words_and_senses:
+        sr   = sense_map.get(surface)
+        meta = tc.word_meta.get(surface, {})
+        if sr is None:
             continue
-        vtt = media.with_suffix(".vtt")
-        if vtt.exists():
-            pairs.append((media, vtt))
+
+        if sr.custom_definition:
+            new_meanings = [sr.custom_definition]
+            new_poses    = ["custom"]
+        elif sr.selected:
+            new_meanings = [s.meaning for s in sr.selected]
+            new_poses    = [s.pos     for s in sr.selected]
         else:
-            print(f"  Skipping {media.name} — no matching .vtt found")
-    return pairs
+            continue
+
+        if surface not in accumulator:
+            accumulator[surface] = _WordAccumulator(
+                word=surface,
+                first_chunk_index=tc.chunk.index,
+                meta=meta,
+            )
+
+        acc = accumulator[surface]
+        for meaning, pos in zip(new_meanings, new_poses):
+            key = (meaning, pos)
+            if key not in acc.seen_sense_keys:
+                acc.seen_sense_keys.add(key)
+                acc.meanings.append(meaning)
+                acc.poses.append(pos)
 
 
-def already_processed(directory: Path) -> set[str]:
-    return {f.name for f in directory.iterdir()}
+def _build_vocab_card(acc: _WordAccumulator, source_name: str) -> VocabCard:
+    """Render a VocabCard from a fully-populated _WordAccumulator."""
+    reading_kata = acc.meta.get("reading_kata", "")
+    reading_hira = _kana_to_hiragana(reading_kata) if reading_kata else ""
+    accent_type  = acc.meta.get("accent_type", "")
+    result       = acc.meta.get("result")
+    jlpt         = _jlpt_for_result(result) if result else ""
+    pitch_html   = _pitch_html(reading_hira, accent_type)
+
+    # Plain meaning string for TTS — no HTML, numbers prefix each sense
+    meaning_plain = "; ".join(
+        f"{acc.meanings[i]} ({acc.poses[i]})" for i in range(len(acc.meanings))
+    )
+
+    # HTML gloss — same structure as sentence card back
+    jlpt_span  = f'<span class="jlpt-badge jlpt-{jlpt}">{jlpt}</span>' if jlpt else ""
+    pitch_span = f'<span class="pa-container">{pitch_html}</span>'       if pitch_html else ""
+    header     = f'<span class="gloss-word">{acc.word}</span>{jlpt_span}{pitch_span}'
+    lines      = [header]
+    for i, meaning in enumerate(acc.meanings, 1):
+        pos_class = _pos_to_class(acc.poses[i - 1])
+        lines.append(
+            f'<span class="{pos_class} gloss-line">'
+            f'{i}) {meaning}'
+            f'<span class="pos-tag"> [{acc.poses[i-1]}]</span>'
+            f'</span>'
+        )
+    gloss_html = "<br>".join(lines)
+
+    return VocabCard(
+        word=acc.word,
+        reading=reading_hira,
+        meaning_plain=meaning_plain,
+        gloss_html=gloss_html,
+        jlpt=jlpt,
+        font_name=_font_for_index(acc.first_chunk_index),
+        source=source_name,
+    )
 
 
 # ── Core processing ───────────────────────────────────────────────────────────
@@ -651,11 +815,10 @@ def already_processed(directory: Path) -> set[str]:
 def process_file(
     media_path: Path,
     vtt_path: Path,
-    deck: genanki.Deck,
+    subdeck: genanki.Deck,
     all_media_files: list[str],
     tmpdir: str,
     frame_offset: float,
-    tts_voice: str,
 ) -> None:
     original_name = media_path.name
     is_mp3        = media_path.suffix.lower() == ".mp3"
@@ -666,13 +829,24 @@ def process_file(
     shutil.copy2(media_path, safe_media)
     shutil.copy2(vtt_path,   safe_vtt)
 
+    # ── Voice cloning: extract reference audio, load into JP TTS ─────────────
+    ref_audio_path = os.path.join(tmpdir, f"voice_ref_{safe_id}.mp3")
+    ref_ok = extract_voice_reference(safe_media, ref_audio_path)
+    if ref_ok and _jp_tts is not None:
+        try:
+            _jp_tts.load_voice(ref_audio_path, transcript="")
+            print(f"  Voice reference loaded for JP TTS ({VOICE_CLONE_DURATION}s clip).")
+        except Exception as e:
+            print(f"  Warning: could not load voice reference: {e}")
+    else:
+        print("  Warning: voice reference extraction failed — using default JP voice.")
+
     print(f"\n  Parsing VTT: {vtt_path.name}")
     raw_chunks: list[RawChunk] = parse_vtt(str(safe_vtt))
     n = len(raw_chunks)
     print(f"    Found {n} chunks")
 
     # ── Stage 1 (main thread, sequential): tokenise all chunks ───────────────
-    # fugashi's Tagger is not thread-safe, so we do this before parallelising.
     print(f"    Tokenising {n} chunks ...")
     contexts: list[FullContext] = [
         build_full_context(i, raw_chunks) for i in range(n)
@@ -681,75 +855,118 @@ def process_file(
         _tokenise_chunk(raw_chunks[i], contexts[i]) for i in range(n)
     ]
 
-    # ── Stage 2 (parallel): translation AND sense selection hit vLLM ─────────
-    # Both pools run concurrently via submit-then-collect; the GIL is released
-    # for the duration of each HTTP call so true parallelism is achieved.
+    # ── Stage 2 (parallel): natural + literal translation AND sense selection ─
     print(f"    Running translation + sense selection in parallel ({LLM_WORKERS} workers) ...")
 
-    translations:  list[str]             = [""] * n
-    sense_results: list[list[SenseResult]] = [[] for _ in range(n)]
+    natural_translations: list[str]              = [""] * n
+    literal_translations: list[str]              = [""] * n
+    sense_results:        list[list[SenseResult]] = [[] for _ in range(n)]
 
-    def _do_translation(i: int) -> tuple[int, str]:
+    def _do_natural_translation(i: int) -> tuple[int, str, str]:
         result = _translate_sentence(
             context=contexts[i],
             base64_encoded_image=None,
             image_mime="image/jpeg",
+            translation_type="natural",
         )
-        return i, result
+        return i, "natural", result
 
-    def _do_sense_selection(i: int) -> tuple[int, list[SenseResult]]:
+    def _do_literal_translation(i: int) -> tuple[int, str, str]:
+        result = _translate_sentence(
+            context=contexts[i],
+            base64_encoded_image=None,
+            image_mime="image/jpeg",
+            translation_type="literal",
+        )
+        return i, "literal", result
+
+    def _do_sense_selection(i: int) -> tuple[int, str, list[SenseResult]]:
         tc     = tokenised[i]
         result = select_senses(tc.context, tc.words_and_senses)
-        return i, result
+        return i, "sense", result
 
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as pool:
-        # Submit all translation and sense-selection jobs together so vLLM can
-        # continuous-batch across both task types simultaneously.
-        translation_futures = {pool.submit(_do_translation, i): i for i in range(n)}
-        sense_futures       = {pool.submit(_do_sense_selection, i): i for i in range(n)}
-        all_futures         = {**translation_futures, **sense_futures}
+        futures: dict = {}
+        for i in range(n):
+            futures[pool.submit(_do_natural_translation, i)] = i
+            futures[pool.submit(_do_literal_translation, i)] = i
+            futures[pool.submit(_do_sense_selection, i)]     = i
 
         completed_count = 0
-        for future in as_completed(all_futures):
-            idx, payload = future.result()
-            if future in translation_futures:
-                translations[idx] = payload
+        total_tasks     = n * 3
+        for future in as_completed(futures):
+            result_tuple = future.result()
+            idx, kind    = result_tuple[0], result_tuple[1]
+            payload      = result_tuple[2]
+            if kind == "natural":
+                natural_translations[idx] = payload
+            elif kind == "literal":
+                literal_translations[idx] = payload
             else:
                 sense_results[idx] = payload
             completed_count += 1
             if completed_count % 10 == 0:
-                print(f"      {completed_count}/{n * 2} LLM tasks done ...")
+                print(f"      {completed_count}/{total_tasks} LLM tasks done ...")
 
-    # ── Stage 3 (main thread, sequential): render gloss HTML ─────────────────
-    print(f"    Rendering gloss HTML ...")
-    completed: list[CompletedChunk] = []
+    # ── Stage 3 (main thread, sequential): render gloss HTML + accumulate vocab ─
+    # Full forward pass: accumulate every sense selected for each word across
+    # the entire video before building vocab cards.  This ensures that if 行く
+    # appears in chunk 2 as "to go" and again in chunk 47 as "to leave", the
+    # single vocab card (anchored at chunk 2) shows both senses.
+    print(f"    Rendering gloss HTML and collecting vocab ...")
+
+    @dataclass
+    class _ChunkData:
+        completed: CompletedChunk
+
+    word_accumulator: dict[str, _WordAccumulator] = {}
+    chunk_data: list[_ChunkData] = []
+
     for i, tc in enumerate(tokenised):
         furigana, word_gloss = _render_gloss_html(tc, sense_results[i])
-        translation = translations[i]
+        natural = natural_translations[i]
+        literal = literal_translations[i]
 
         print(f"      [{i+1}/{n}] {tc.chunk.subtitle_text[:45]}")
-        if translation:
-            print(f"        → {translation[:65]}")
-        if word_gloss:
-            print(f"        ≈ {re.sub(r'<[^>]+>', '', word_gloss)[:65]}")
+        if natural:
+            print(f"        → {natural[:65]}")
 
-        completed.append(CompletedChunk(
+        completed_chunk = CompletedChunk(
             index=tc.chunk.index,
             start=tc.chunk.start,
             end=tc.chunk.end,
             subtitle_text=tc.chunk.subtitle_text,
-            translation=translation,
-            word_gloss=word_gloss,
+            natural_translation=natural,
+            literal_translation=literal,
+            word_gloss=sense_results[i],
             furigana=furigana,
-        ))
+        )
 
-    # ── Stage 4 (parallel): TTS + audio extraction + frame extraction ─────────
-    # All three are I/O-bound (HTTP to Fish, subprocess ffmpeg) and fully
-    # independent per card, so we parallelise across cards.
-    print(f"    Generating media for {n} cards in parallel ({MEDIA_WORKERS} workers) ...")
+        # Accumulate senses for every word in this chunk (no early exit on
+        # already-seen words — a word may carry a new sense later in the video)
+        _accumulate_senses(tc, sense_results[i], word_accumulator)
+
+        chunk_data.append(_ChunkData(completed=completed_chunk))
+
+    # Build one VocabCard per word with all senses seen across the video.
+    # vocab_cards_by_chunk maps first_chunk_index → cards so stage 5 can insert
+    # each vocab card immediately after the sentence that introduced the word.
+    vocab_cards_by_chunk: dict[int, list[VocabCard]] = {}
+    for acc in word_accumulator.values():
+        vocab_cards_by_chunk.setdefault(acc.first_chunk_index, []).append(
+            _build_vocab_card(acc, original_name)
+        )
+    total_vocab = sum(len(v) for v in vocab_cards_by_chunk.values())
+    print(f"    {total_vocab} unique vocab cards across {n} chunks.")
+
+    # ── Stage 4 (parallel): all media generation ──────────────────────────────
+    # Per sentence: source audio clip, video frame, EN TTS of natural translation.
+    # Per vocab card: JP TTS of word (front), EN TTS of meaning (back).
+    # All are I/O-bound and fully independent.
+    print(f"    Generating media in parallel ({MEDIA_WORKERS} workers) ...")
 
     @dataclass
-    class _CardMedia:
+    class _SentenceMedia:
         audio_fname: str = ""
         image_fname: str = ""
         tts_fname:   str = ""
@@ -757,13 +974,25 @@ def process_file(
         image_ok:    bool = False
         tts_ok:      bool = False
 
-    def _process_card_media(chunk: CompletedChunk) -> tuple[int, _CardMedia]:
+    @dataclass
+    class _VocabMedia:
+        word_tts_fname:    str  = ""
+        meaning_tts_fname: str  = ""
+        word_tts_ok:       bool = False
+        meaning_tts_ok:    bool = False
+
+    sentence_media: dict[int, _SentenceMedia] = {}
+    # keyed by word string (one entry per unique word across whole video)
+    vocab_media: dict[str, _VocabMedia] = {}
+
+    def _process_sentence_media(cd: _ChunkData) -> tuple[int, _SentenceMedia]:
+        chunk     = cd.completed
         idx       = chunk.index
         card_uuid = uuid.uuid4().hex
-        media     = _CardMedia(
+        media     = _SentenceMedia(
             audio_fname=f"clip_{idx:04d}_{card_uuid}.mp3",
             image_fname=f"frame_{idx:04d}_{card_uuid}.jpg",
-            tts_fname=f"tts_{idx:04d}_{card_uuid}.mp3",
+            tts_fname=f"tts_sent_{idx:04d}_{card_uuid}.mp3",
         )
         audio_path = os.path.join(tmpdir, media.audio_fname)
         image_path = os.path.join(tmpdir, media.image_fname)
@@ -773,56 +1002,120 @@ def process_file(
         if not is_mp3:
             frame_ts = chunk.start + min(frame_offset, (chunk.end - chunk.start) * 0.5)
             media.image_ok = extract_frame(str(safe_media), frame_ts, image_path)
-        if chunk.translation:
-            media.tts_ok = generate_tts(chunk.translation, tts_path, voice=tts_voice)
+        if chunk.natural_translation:
+            # EN TTS for the natural translation on the sentence card back
+            media.tts_ok = generate_en_tts(chunk.natural_translation, tts_path)
 
         return idx, media
 
-    card_media: dict[int, _CardMedia] = {}
-    with ThreadPoolExecutor(max_workers=MEDIA_WORKERS) as pool:
-        futures = {pool.submit(_process_card_media, chunk): chunk.index for chunk in completed}
-        for future in as_completed(futures):
-            idx, media = future.result()
-            card_media[idx] = media
-            chunk = completed[idx]
-            print(f"      [{idx+1}/{n}] {chunk.start:.1f}s–{chunk.end:.1f}s  {chunk.subtitle_text[:35]}")
-            if not media.audio_ok:                print("        Warning: audio extraction failed")
-            if not media.image_ok and not is_mp3: print("        Warning: frame extraction failed")
-            if not media.tts_ok:                  print("        Warning: TTS generation failed")
+    def _process_vocab_media(vc: VocabCard) -> tuple[str, _VocabMedia]:
+        card_uuid = uuid.uuid4().hex
+        media     = _VocabMedia(
+            word_tts_fname=f"tts_vocab_jp_{card_uuid}.mp3",
+            meaning_tts_fname=f"tts_vocab_en_{card_uuid}.mp3",
+        )
+        word_tts_path    = os.path.join(tmpdir, media.word_tts_fname)
+        meaning_tts_path = os.path.join(tmpdir, media.meaning_tts_fname)
 
-    # ── Stage 5 (main thread): assemble Anki notes in original order ──────────
-    for chunk in completed:
-        media     = card_media[chunk.index]
-        idx       = chunk.index
-        audio_path = os.path.join(tmpdir, media.audio_fname)
-        image_path = os.path.join(tmpdir, media.image_fname)
-        tts_path   = os.path.join(tmpdir, media.tts_fname)
+        # JP TTS: just the word itself, using the cloned voice from this video
+        media.word_tts_ok    = generate_jp_tts(vc.word, word_tts_path)
+        # EN TTS: the plain meaning string (all senses, no HTML)
+        media.meaning_tts_ok = generate_en_tts(vc.meaning_plain, meaning_tts_path)
+
+        return vc.word, media
+
+    # Collect all unique vocab cards (one per word, already built above)
+    all_vocab_cards_flat: list[VocabCard] = [
+        vc for vcs in vocab_cards_by_chunk.values() for vc in vcs
+    ]
+
+    with ThreadPoolExecutor(max_workers=MEDIA_WORKERS) as pool:
+        sent_futures  = {pool.submit(_process_sentence_media, cd): cd.completed.index for cd in chunk_data}
+        # One TTS job per unique word — keyed by word string
+        vocab_futures = {
+            pool.submit(_process_vocab_media, vc): vc.word
+            for vc in all_vocab_cards_flat
+        }
+        all_futures = {**sent_futures, **vocab_futures}
+
+        for future in as_completed(all_futures):
+            if future in sent_futures:
+                idx, media = future.result()
+                sentence_media[idx] = media
+                chunk = chunk_data[idx].completed
+                print(f"      [sent {idx+1}/{n}] {chunk.start:.1f}s–{chunk.end:.1f}s  {chunk.subtitle_text[:35]}")
+                if not media.audio_ok:                print("        Warning: audio extraction failed")
+                if not media.image_ok and not is_mp3: print("        Warning: frame extraction failed")
+                if not media.tts_ok:                  print("        Warning: sentence TTS failed")
+            else:
+                word, media = future.result()
+                vocab_media[word] = media
+                if not media.word_tts_ok:    print(f"        Warning: JP TTS failed for vocab word '{word}'")
+                if not media.meaning_tts_ok: print(f"        Warning: EN TTS failed for vocab word '{word}'")
+
+    # ── Stage 5: assemble Anki notes in chronological order ──────────────────
+    # For each chunk: sentence note first, then vocab notes for new words.
+    print(f"    Assembling notes in order ...")
+    for cd in chunk_data:
+        chunk      = cd.completed
+        idx        = chunk.index
+        s_media    = sentence_media.get(idx, _SentenceMedia())
         timecode   = f"{int(chunk.start // 60):02d}:{chunk.start % 60:05.2f}"
 
-        note = genanki.Note(
-            model=CARD_MODEL,
+        # Sentence note
+        sentence_note = genanki.Note(
+            model=SENTENCE_MODEL,
             fields=[
                 chunk.subtitle_text,
-                f"[sound:{media.audio_fname}]"     if media.audio_ok else "",
-                f'<img src="{media.image_fname}">' if media.image_ok else "",
-                chunk.translation,
-                f"[sound:{media.tts_fname}]"       if media.tts_ok   else "",
+                f"[sound:{s_media.audio_fname}]"     if s_media.audio_ok else "",
+                f'<img src="{s_media.image_fname}">' if s_media.image_ok else "",
+                chunk.natural_translation,
+                chunk.literal_translation,
+                f"[sound:{s_media.tts_fname}]"       if s_media.tts_ok   else "",
                 chunk.furigana,
-                chunk.word_gloss,
+                # word_gloss field is HTML rendered in stage 3
+                _render_gloss_html(tokenised[idx], chunk.word_gloss)[1],
                 timecode,
                 _font_for_index(idx),
                 original_name,
                 "",
             ],
         )
-        deck.add_note(note)
+        subdeck.add_note(sentence_note)
 
-        if media.audio_ok: all_media_files.append(audio_path)
-        if media.image_ok: all_media_files.append(image_path)
-        if media.tts_ok:   all_media_files.append(tts_path)
+        if s_media.audio_ok: all_media_files.append(os.path.join(tmpdir, s_media.audio_fname))
+        if s_media.image_ok: all_media_files.append(os.path.join(tmpdir, s_media.image_fname))
+        if s_media.tts_ok:   all_media_files.append(os.path.join(tmpdir, s_media.tts_fname))
+
+        # Vocab notes immediately after — words introduced for the first time in this chunk
+        for vc in vocab_cards_by_chunk.get(idx, []):
+            v_media = vocab_media.get(vc.word, _VocabMedia())
+
+            vocab_note = genanki.Note(
+                model=VOCAB_MODEL,
+                fields=[
+                    vc.word,
+                    f"[sound:{v_media.word_tts_fname}]"    if v_media.word_tts_ok    else "",
+                    vc.reading,
+                    vc.meaning_plain,
+                    f"[sound:{v_media.meaning_tts_fname}]" if v_media.meaning_tts_ok else "",
+                    vc.gloss_html,
+                    vc.jlpt,
+                    vc.font_name,
+                    vc.source,
+                ],
+            )
+            subdeck.add_note(vocab_note)
+
+            if v_media.word_tts_ok:    all_media_files.append(os.path.join(tmpdir, v_media.word_tts_fname))
+            if v_media.meaning_tts_ok: all_media_files.append(os.path.join(tmpdir, v_media.meaning_tts_fname))
 
     safe_media.unlink(missing_ok=True)
     safe_vtt.unlink(missing_ok=True)
+    try:
+        Path(ref_audio_path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -831,13 +1124,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Batch Anki deck generator from to_process/ directory")
     parser.add_argument("--frame-offset", type=float, default=1.0,
                         help="Seconds after chunk start to grab frame (default: 1.0)")
-    parser.add_argument("--deck-name", default="Japanese Video Deck")
-    parser.add_argument("--tts-voice", default="",
-                        help="Fish Audio reference_id for a saved speaker voice (optional)")
+    parser.add_argument("--deck-name", default="Japanese Video Deck",
+                        help="Name of the parent Anki deck (default: 'Japanese Video Deck')")
+    parser.add_argument("--jp-tts", default="fish",
+                        help="JP TTS backend: 'fish' or 'kokoro' (default: fish)")
+    parser.add_argument("--en-tts", default="kokoro",
+                        help="EN TTS backend: 'fish' or 'kokoro' (default: kokoro)")
     parser.add_argument("--llm-workers", type=int, default=LLM_WORKERS,
-                        help=f"Concurrent vLLM requests for translation+sense (default: {LLM_WORKERS})")
+                        help=f"Concurrent vLLM requests (default: {LLM_WORKERS})")
     parser.add_argument("--media-workers", type=int, default=MEDIA_WORKERS,
-                        help=f"Concurrent TTS+ffmpeg jobs per card (default: {MEDIA_WORKERS})")
+                        help=f"Concurrent TTS+ffmpeg jobs (default: {MEDIA_WORKERS})")
     args = parser.parse_args()
 
     check_ffmpeg()
@@ -856,16 +1152,16 @@ def main() -> None:
 
     if not setup_word_glosser():
         raise ValueError("Failed to set up word glosser")
-    if not setup_tts():
-        raise ValueError("Failed to set up TTS")
 
-    font_files  = list(FONTS_DIR.glob("*.ttf")) if FONTS_DIR.exists() else []
-    already_done = already_processed(PROCESSED_DIR)
-
-    # Patch worker counts from CLI if provided
     global LLM_WORKERS, MEDIA_WORKERS
     LLM_WORKERS   = args.llm_workers
     MEDIA_WORKERS = args.media_workers
+
+    if not setup_tts(args.jp_tts, args.en_tts):
+        raise ValueError("Failed to set up TTS")
+
+    font_files   = list(FONTS_DIR.glob("*.ttf")) if FONTS_DIR.exists() else []
+    already_done = already_processed(PROCESSED_DIR)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, (media_path, vtt_path) in enumerate(pairs):
@@ -874,22 +1170,29 @@ def main() -> None:
                 continue
             already_done.add(media_path.name)
 
-            deck        = genanki.Deck(DECK_ID, args.deck_name)
+            # Each video gets its own subdeck under the parent.
+            video_title  = media_path.stem
+            subdeck_name = f"{args.deck_name}::{video_title}"
+            # Use a deterministic deck ID derived from the subdeck name so
+            # re-running the same video doesn't create duplicate decks.
+            subdeck_id   = abs(hash(subdeck_name)) % (10 ** 10)
+            subdeck      = genanki.Deck(subdeck_id, subdeck_name)
+
             media_files = [str(f) for f in font_files]
             output      = f"output_{media_path.stem}.apkg"
 
             print(f"\n{'='*60}")
             print(f"Processing ({i+1}/{len(pairs)}): {media_path.name}")
+            print(f"  Subdeck: {subdeck_name}")
             try:
                 process_file(
                     media_path, vtt_path,
-                    deck, media_files, tmpdir,
+                    subdeck, media_files, tmpdir,
                     args.frame_offset,
-                    tts_voice=args.tts_voice,
                 )
                 print(f"\n{'='*60}")
                 print(f"Writing {output} ...")
-                pkg = genanki.Package(deck)
+                pkg = genanki.Package(subdeck)
                 pkg.media_files = media_files
                 pkg.write_to_file(output)
 
@@ -900,6 +1203,23 @@ def main() -> None:
             except Exception as e:
                 print(f"  ERROR processing {media_path.name}: {e}")
                 import traceback; traceback.print_exc()
+
+
+def find_pairs(directory: Path) -> list[tuple[Path, Path]]:
+    pairs = []
+    for media in sorted(directory.iterdir()):
+        if media.suffix.lower() not in (".mp4", ".mp3"):
+            continue
+        vtt = media.with_suffix(".vtt")
+        if vtt.exists():
+            pairs.append((media, vtt))
+        else:
+            print(f"  Skipping {media.name} — no matching .vtt found")
+    return pairs
+
+
+def already_processed(directory: Path) -> set[str]:
+    return {f.name for f in directory.iterdir()}
 
 
 if __name__ == "__main__":

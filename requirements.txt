@@ -1,0 +1,10 @@
+genanki
+fugashi
+jamdict
+jamdict-data
+unidic-lite
+soundfile
+numpy
+huggingface-hub
+pyaudio
+httpx
