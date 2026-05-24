@@ -52,14 +52,14 @@ logger = logging.getLogger(__name__)
 
 
 @define
-class TranslateRequest:
+class TranslationRequest:
     context: FullContext
     base64_encoded_image: str | None
     image_mime: str
     translation_type: Literal["natural"] | Literal["literal"]
 
 
-def translate_sentence(request: TranslateRequest) -> str:
+def translate_sentence(request: TranslationRequest) -> str:
     prompt = f"Translate the Japanese subtitle chunk to {request.translation_type} English."
     prompt += request.context.get_chunking_context_prompt()
     if request.base64_encoded_image:
@@ -81,7 +81,7 @@ def translate_sentence(request: TranslateRequest) -> str:
     )
     return prompt_with_retries(prompt_req)
 
-def translate_batch(requests: list[TranslateRequest]) -> list[str]:
+def translate_batch(requests: list[TranslationRequest]) -> list[str]:
     n = len(requests)
     translations = [""] * n
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as pool:

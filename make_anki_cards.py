@@ -41,7 +41,7 @@ from src.parser.jlpt import jlpt_for_result
 from src.parser.vtt import parse_vtt
 from src.common.types import RawChunk, FullContext, Sense, SenseResult, CompletedChunk
 from src.common.utils import server_available
-from src.prompting.translator import translate_sentence as _translate_sentence
+from src.prompting.translator import TranslationRequest, translate_sentence as _translate_sentence
 from src.prompting.sense_selector import select_senses
 from src.tts.tts import TTSBackend
 from src.tts.factory import build_tts_pair
@@ -425,21 +425,23 @@ def process_file(
     sense_results:        list[list[SenseResult]] = [[] for _ in range(n)]
 
     def _do_natural_translation(i: int) -> tuple[int, str, str]:
-        result = _translate_sentence(
+        req = TranslationRequest(
             context=contexts[i],
             base64_encoded_image=None,
             image_mime="image/jpeg",
             translation_type="natural",
         )
+        result = _translate_sentence(req)
         return i, "natural", result
 
     def _do_literal_translation(i: int) -> tuple[int, str, str]:
-        result = _translate_sentence(
+        req = TranslationRequest(
             context=contexts[i],
             base64_encoded_image=None,
             image_mime="image/jpeg",
             translation_type="literal",
         )
+        result = _translate_sentence(req)
         return i, "literal", result
 
     def _do_sense_selection(i: int) -> tuple[int, str, list[SenseResult]]:
