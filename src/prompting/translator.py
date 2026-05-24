@@ -1,8 +1,13 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from typing import Literal
+
+from attr import define
 from src.common.types import FullContext
 from src.common.utils import assert_latin_extended_only
-from src.prompting.prompter import prompt_with_retries
+from src.prompting.prompter import PromptRequest, prompt_with_retries
+
+LLM_WORKERS   = 8
 
 
 _NATURAL_TRANSLATION_SYSTEM = (
@@ -46,28 +51,49 @@ _LITERAL_TRANSLATION_SYSTEM = (
 logger = logging.getLogger(__name__)
 
 
-def translate_sentence(
-    context: FullContext,
-    base64_encoded_image: str | None,
-    image_mime: str,
+@define
+class TranslateRequest:
+    context: FullContext
+    base64_encoded_image: str | None
+    image_mime: str
     translation_type: Literal["natural"] | Literal["literal"]
-) -> str:
-    prompt = f"Translate the Japanese subtitle chunk to {translation_type} English."
-    prompt += context.get_chunking_context_prompt()
-    if base64_encoded_image:
+
+
+def translate_sentence(request: TranslateRequest) -> str:
+    prompt = f"Translate the Japanese subtitle chunk to {request.translation_type} English."
+    prompt += request.context.get_chunking_context_prompt()
+    if request.base64_encoded_image:
         prompt += "\n\nA frame captured sometime into this subtitle is attached for context."
-    prompt += f"\nNow translate the Japanese subtitle target chunk to {translation_type} English.\nThe chunk:\n{context.target_chunk.pretty_string()}"
+    prompt += f"\nNow translate the Japanese subtitle target chunk to {request.translation_type} English.\nThe chunk:\n{request.context.target_chunk.pretty_string()}"
     system_prompt = ""
-    if translation_type == "natural":
+    if request.translation_type == "natural":
         system_prompt = _NATURAL_TRANSLATION_SYSTEM
-    elif translation_type == "literal":
+    elif request.translation_type == "literal":
         system_prompt = _LITERAL_TRANSLATION_SYSTEM
     else:
-        raise ValueError(f"Unknown translation type: {translation_type}")
-    return prompt_with_retries(
+        raise ValueError(f"Unknown translation type: {request.translation_type}")
+    prompt_req = PromptRequest(
         system_prompt=system_prompt,
         user_prompt=prompt,
-        base64_encoded_image=base64_encoded_image,
-        image_mime=image_mime,
+        base64_encoded_image=request.base64_encoded_image,
+        image_mime=request.image_mime,
         validator=assert_latin_extended_only
     )
+    return prompt_with_retries(prompt_req)
+
+def translate_batch(requests: list[TranslateRequest]) -> list[str]:
+    n = len(requests)
+    translations = [""] * n
+    with ThreadPoolExecutor(max_workers=LLM_WORKERS) as pool:
+        futures: dict = {}
+        for i in range(n):
+            futures[pool.submit(translate_sentence, requests[i])] = i
+
+        completed_count = 0
+        for future in as_completed(futures):
+            result_tuple = future.result()
+            idx, payload    = result_tuple[0], result_tuple[1]
+            translations[idx] = payload
+            completed_count += 1
+            logger.info(f"      {completed_count}/{n} LLM translations done ...")
+    return translations
