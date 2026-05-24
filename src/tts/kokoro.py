@@ -8,6 +8,10 @@ from src.tts.tts import Lang, TTSBackend
 KOKORO_MODEL_PATH  = "./models/kokoro/kokoro-v1.0.onnx"
 KOKORO_VOICES_PATH = "./models/kokoro/voices-v1.0.bin"
 
+_KOKORO_LANG_CODE: dict[Lang, str] = {
+    "ja": "ja",
+    "en": "en-us",
+}
 
 KOKORO_DEFAULT_VOICES: dict[Lang, str] = {
     "ja": "jf_alpha",
@@ -51,7 +55,7 @@ class KokoroBackend(TTSBackend):
         try:
             with self._lock:
                 samples, sample_rate = self._kokoro.create(
-                    text, voice=voice, speed=1.0, lang=self.lang,
+                    text, voice=voice, speed=1.0, lang=_KOKORO_LANG_CODE[self.lang],
                 )
             sf.write(out_path, samples, sample_rate)
             return True
