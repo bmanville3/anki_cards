@@ -6,3 +6,5 @@ jlpt_words.json
 output_*
 yomitan-jlpt-vocab/
 .DS_Store
+__pycache__/*
+models/*
