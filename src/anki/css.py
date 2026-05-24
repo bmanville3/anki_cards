@@ -1,4 +1,4 @@
-from anki.fonts_helper import FONTS_DIR, build_font_face_css
+from src.anki.fonts_helper import FONTS_DIR, build_font_face_css
 
 
 FONT_FACE_CSS = build_font_face_css(FONTS_DIR)

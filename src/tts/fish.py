@@ -2,7 +2,7 @@ from pathlib import Path
 
 import httpx
 
-from tts.tts import Lang, TTSBackend
+from src.tts.tts import Lang, TTSBackend
 
 
 FISH_TTS_URL    = "http://127.0.0.1:8080/v1/tts"

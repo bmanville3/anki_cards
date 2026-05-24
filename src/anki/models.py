@@ -1,6 +1,6 @@
 import genanki
 
-from anki.css import SHARED_CSS
+from src.anki.css import SHARED_CSS
 
 
 PARENT_DECK_ID = 9_876_543_210

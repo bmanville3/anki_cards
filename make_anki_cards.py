@@ -34,11 +34,11 @@ import fugashi
 import genanki
 import unidic_lite
 
-from anki.fonts_helper import FONTS_DIR, font_for_index, pos_to_class
-from anki.models import SENTENCE_MODEL, VOCAB_MODEL
-from parser.jamdict import jamdict_senses_for
-from parser.jlpt import jlpt_for_result
-from parser.vtt import parse_vtt
+from src.anki.fonts_helper import FONTS_DIR, font_for_index, pos_to_class
+from src.anki.models import SENTENCE_MODEL, VOCAB_MODEL
+from src.parser.jamdict import jamdict_senses_for
+from src.parser.jlpt import jlpt_for_result
+from src.parser.vtt import parse_vtt
 from src.common.types import RawChunk, FullContext, Sense, SenseResult, CompletedChunk
 from src.common.utils import server_available
 from src.prompting.translator import translate_sentence as _translate_sentence

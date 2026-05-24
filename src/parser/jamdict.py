@@ -1,9 +1,7 @@
-import fugashi
 from jamdict import Jamdict
 from jamdict.util import LookupResult
-import unidic_lite
 
-from common.types import Sense
+from src.common.types import Sense
 
 MAX_ENTRIES           = 10
 MAX_SENSES            = 10

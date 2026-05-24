@@ -1,7 +1,7 @@
 from pathlib import Path
 import re
 
-from common.types import RawChunk
+from src.common.types import RawChunk
 
 
 def vtt_time_to_seconds(t: str) -> float:

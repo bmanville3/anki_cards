@@ -1,6 +1,6 @@
-from tts.fish import FishBackend
-from tts.kokoro import KokoroBackend
-from tts.tts import Lang, TTSBackend
+from src.tts.fish import FishBackend
+from src.tts.kokoro import KokoroBackend
+from src.tts.tts import Lang, TTSBackend
 
 
 _BACKENDS: dict[str, type[TTSBackend]] = {

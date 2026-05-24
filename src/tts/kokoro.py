@@ -2,7 +2,7 @@ from pathlib import Path
 import threading
 import soundfile as sf
 
-from tts.tts import Lang, TTSBackend
+from src.tts.tts import Lang, TTSBackend
 
 
 KOKORO_MODEL_PATH  = "./models/kokoro/kokoro-v1.0.onnx"
