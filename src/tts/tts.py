@@ -23,7 +23,7 @@ class TTSResult:
 
 
 class TTSBackend(ABC):
-    def __init__(self, lang: Lang) -> None:
+    def __init__(self, lang: Lang, **kwargs) -> None:
         self.lang = lang
 
     @abstractmethod

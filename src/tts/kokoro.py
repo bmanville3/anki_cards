@@ -21,8 +21,9 @@ class KokoroBackend(TTSBackend):
         lang:        Lang = "ja",
         model_path:  str  = KOKORO_MODEL_PATH,
         voices_path: str  = KOKORO_VOICES_PATH,
+        **kwargs,
     ) -> None:
-        super().__init__(lang)
+        super().__init__(lang, **kwargs)
         self._model_path  = model_path
         self._voices_path = voices_path
         self._kokoro      = None

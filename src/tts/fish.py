@@ -16,8 +16,9 @@ class FishBackend(TTSBackend):
         tts_url:         str  = FISH_TTS_URL,
         health_url:      str  = FISH_HEALTH_URL,
         max_connections: int  = 8,
+        **kwargs,
     ) -> None:
-        super().__init__(lang)
+        super().__init__(lang, **kwargs)
         self._tts_url     = tts_url
         self._health_url  = health_url
         self._client      = httpx.Client(
