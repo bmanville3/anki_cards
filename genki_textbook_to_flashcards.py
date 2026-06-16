@@ -44,8 +44,8 @@ from pathlib import Path
 
 from attr import define
 
-from common.utils import load_image_b64
-from prompting.prompter import PromptRequest, prompt_with_retries
+from src.common.utils import load_image_b64, server_available
+from src.prompting.prompter import PromptRequest, prompt_with_retries
 
 logger = logging.getLogger(__name__)
 
@@ -247,13 +247,16 @@ def load_pages(
 
             doc = fitz.open(str(src))
             for page_num, page in enumerate(doc, start=1):
-                mat = fitz.Matrix(dpi / 72, dpi / 72)
-                pix = page.get_pixmap(matrix=mat)
-
                 label    = f"{src.stem}_p{page_num:03d}"
                 png_path = out_dir / f"{label}.png"
-                pix.save(str(png_path))
-                logger.info("  Saved page image → %s", png_path)
+
+                if png_path.exists():
+                    logger.info("  Skipping existing page image → %s", png_path)
+                else:
+                    mat = fitz.Matrix(dpi / 72, dpi / 72)
+                    pix = page.get_pixmap(matrix=mat)
+                    pix.save(str(png_path))
+                    logger.info("  Saved page image → %s", png_path)
 
                 b64 = base64.b64encode(png_path.read_bytes()).decode()
                 pages.append((b64, "image/png", label))
@@ -292,6 +295,7 @@ def _run_extraction(b64: str, mime: str, context_block: str) -> tuple[list[dict]
         base64_encoded_image=b64,
         image_mime=mime,
         max_retries=4,
+        validator=_parse_extract_response,
     )
     raw = prompt_with_retries(req)
     return _parse_extract_response(raw)
@@ -319,6 +323,7 @@ def _run_critique(
         base64_encoded_image=b64,
         image_mime=mime,
         max_retries=4,
+        validator=_parse_critique_response,
     )
     raw = prompt_with_retries(req)
     return _parse_critique_response(raw)
@@ -516,7 +521,11 @@ def main() -> None:
     for p in input_paths:
         if not p.exists():
             sys.exit(f"File not found: {p}")
-
+    
+    if not server_available():
+        print("Server not found. Check port")
+        sys.exit(1)
+    
     png_out_dir = Path(args.png_dir) if args.png_dir else None
 
     print("Loading input file(s)...")
@@ -528,6 +537,8 @@ def main() -> None:
 
     all_cards: list[AnkiCard] = []
     context_summaries: list[str] = []
+    out_path = Path(args.output)
+    FLUSH_EVERY = 100   # write a checkpoint CSV after every N cards
 
     for i, (b64, mime, label) in enumerate(pages, start=1):
         print(f"── Page {i}/{len(pages)}: {label}")
@@ -542,7 +553,12 @@ def main() -> None:
             context_summaries.append(result.context_summary)
         print(f"   → {len(result.cards)} cards  |  running total: {len(all_cards)}\n")
 
-    write_csv(all_cards, Path(args.output))
+        # Periodic checkpoint flush
+        if len(all_cards) // FLUSH_EVERY > (len(all_cards) - len(result.cards)) // FLUSH_EVERY:
+            write_csv(all_cards, out_path)
+            print(f"  [checkpoint] flushed {len(all_cards)} cards → {out_path}\n")
+
+    write_csv(all_cards, out_path)
 
     print("\nFirst 5 cards preview:")
     for c in all_cards[:5]:
