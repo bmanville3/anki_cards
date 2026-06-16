@@ -8,9 +8,9 @@ from openai import OpenAI
 LLM_API_KEY = "EMPTY"
 LLM_MODEL = "google/gemma-4-31B-it"
 LLM_BASE_URL = "http://localhost:9090/v1"
-LLM_MAX_TOKENS = 2048
+LLM_MAX_TOKENS = 8192
 LLM_TEMPERATURE = 0.1
-LLM_WORKERS = 32
+LLM_WORKERS = 8
 
 CLIENT = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
