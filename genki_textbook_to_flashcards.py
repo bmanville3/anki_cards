@@ -15,6 +15,12 @@ Fully automated pipeline per page:
                 definitions/notes from fix cards, inserts add cards,
                 deduplicates. Zero human input required.
 
+Anki note fields produced:
+  Japanese | Furigana | Japanese Audio | Textbook Definition | Picture | Additional Notes | Tags
+
+Furigana format uses Anki's ruby notation: 漢字[かんじ]
+Pure-kana items get an empty Furigana field (no need to echo kana).
+
 Usage:
     python genki_to_anki.py --input genki_ch5.pdf --output ch5.csv --tag "Genki::Chapter5"
     python genki_to_anki.py --input p40.png p41.png --output cards.csv
@@ -33,6 +39,7 @@ import json
 import logging
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from attr import define
@@ -50,6 +57,7 @@ logger = logging.getLogger(__name__)
 @define
 class AnkiCard:
     japanese: str
+    furigana: str           # Anki ruby notation e.g. 食べ物[たべもの] — empty if pure kana
     textbook_definition: str
     picture: str
     additional_notes: str = ""
@@ -60,7 +68,16 @@ class AnkiCard:
 class PageResult:
     label: str
     cards: list[AnkiCard]
-    context_summary: str   # fed into the next page(s) as rolling context
+    context_summary: str
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kanji detection helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _has_kanji(text: str) -> bool:
+    """Return True if the string contains at least one CJK unified ideograph."""
+    return any(unicodedata.category(ch) == "Lo" and "\u4e00" <= ch <= "\u9fff" for ch in text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,6 +103,7 @@ Return ONLY a valid JSON object with exactly these two keys — no prose, no fen
   "cards": [
     {
       "japanese":   "<word, phrase, or full sentence exactly as printed>",
+      "furigana":   "<Anki ruby notation string — see rules below>",
       "definition": "<English meaning/translation exactly as printed; translate yourself only if no gloss is shown>",
       "card_type":  "vocab" | "sentence",
       "notes":      "<grammar notes, conjugation hints, usage context visible near this item — empty string if none>"
@@ -93,6 +111,21 @@ Return ONLY a valid JSON object with exactly these two keys — no prose, no fen
   ],
   "page_summary": "<2-4 sentence plain-English description of what this page covers, for use as context on the next page>"
 }
+
+Furigana rules:
+  - Use Anki ruby notation: write each kanji run immediately followed by its \
+reading in square brackets.  Example: 食べ物[たべもの] is WRONG — kanji and \
+kana must be separated correctly: 食[た]べ物[もの] is WRONG too since べ is \
+okurigana.  The correct form is  食べ[たべ]物[もの]  — group each kanji+okurigana \
+block together before the bracket.
+  - Simpler rule: wrap the SMALLEST natural reading unit.  \
+食べる → 食[た]べる  (only the kanji 食 needs a bracket, okurigana べる stays outside). \
+日本語 → 日本[にほん]語[ご]  (two separate kanji words). \
+東京 → 東京[とうきょう]  (one compound, one bracket).
+  - If the item contains NO kanji (pure hiragana or katakana), set furigana to "".
+  - If you are unsure of the correct reading, set furigana to "" rather than guessing.
+  - The textbook often prints furigana directly above kanji — use those readings \
+exactly when visible; do not substitute your own.
 
 Extraction rules:
   - Capture vocabulary lists, conjugation tables, grammar pattern boxes, \
@@ -123,29 +156,31 @@ Apply these checks in order:
   CORRECTNESS    — Verify the English definition is accurate.
                    If it is wrong or imprecise, set action "fix" AND write the
                    corrected definition directly into the "definition" field.
-                   The pipeline uses your "definition" value verbatim — do NOT
-                   leave the old wrong value in the field.
 
-  NOTES FIX      — If the notes field is missing useful grammar/context that
-                   is visible on the page, add it. Set action "fix" if you
-                   change notes (even if definition was fine).
+  FURIGANA       — Verify the furigana field for every card that contains kanji.
+                   Check the readings visible on the page (printed furigana, \
+                   vocabulary lists, etc.).
+                   Fix errors using Anki ruby notation: 食[た]べる, 東京[とうきょう].
+                   Set furigana to "" for pure-kana items.
+                   Set action "fix" if you change furigana (even if definition was fine).
+
+  NOTES FIX      — If the notes field is missing useful grammar/context visible
+                   on the page, add it and set action "fix".
 
   RELEVANCE      — Remove pure meta-text: exercise labels, "Answer Key",
                    "Listen and repeat", section headers, etc.
 
-  COMPLETENESS   — Scan the image for any Japanese text not in the candidate
-                   list. Add missed items with action "add", filling all fields
-                   completely from the page content.
+  COMPLETENESS   — Scan the image for Japanese text not in the candidate list.
+                   Add missed items with action "add", filling ALL fields.
 
-  DUPLICATES     — If the same Japanese string appears more than once, keep the
-                   most complete version (action "keep" or "fix") and remove the
-                   rest (action "remove").
+  DUPLICATES     — Keep the most complete version; remove the rest.
 
 Return ONLY a valid JSON array — no fences, no prose:
 
 [
   {
     "japanese":   "<exactly as on the page>",
+    "furigana":   "<Anki ruby notation, or empty string for pure kana>",
     "definition": "<correct English — YOUR corrected value if action is fix>",
     "card_type":  "vocab" | "sentence",
     "notes":      "<complete, corrected notes>",
@@ -186,7 +221,6 @@ def _parse_critique_response(raw: str) -> list[dict]:
 # Image / PDF loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def load_pages(
     paths: list[Path],
     dpi: int = 150,
@@ -218,7 +252,7 @@ def load_pages(
 
                 label    = f"{src.stem}_p{page_num:03d}"
                 png_path = out_dir / f"{label}.png"
-                pix.save(str(png_path))          # write PNG to disk
+                pix.save(str(png_path))
                 logger.info("  Saved page image → %s", png_path)
 
                 b64 = base64.b64encode(png_path.read_bytes()).decode()
@@ -276,7 +310,7 @@ def _run_critique(
         + (f"{context_block}\n\n" if context_block else "")
         + f"Candidate cards:\n{cards_json}\n\n"
         "Audit every card against the page image. "
-        "For any 'fix' card, write the corrected values directly into 'definition' and 'notes'. "
+        "For any 'fix' card, write the corrected values directly into 'definition', 'furigana', and 'notes'. "
         "Return the complete corrected JSON array."
     )
     req = PromptRequest(
@@ -298,7 +332,7 @@ def _merge_cards(audited: list[dict], label: str) -> list[dict]:
     """
     Apply the critique's decisions automatically:
       remove  → dropped entirely
-      fix     → card kept with the critique's corrected definition/notes/card_type
+      fix     → kept with the critique's corrected definition/furigana/notes/card_type
       add     → inserted with all fields from the critique
       keep    → passed through unchanged
     Duplicates (same japanese string) → only the first surviving occurrence kept.
@@ -312,25 +346,21 @@ def _merge_cards(audited: list[dict], label: str) -> list[dict]:
         japanese = str(card.get("japanese", "")).strip()
         reason   = card.get("reason", "")
 
-        # Drop removes first
         if action == "remove":
             logger.info("  ✗ REMOVE  %-40s  %s", japanese, reason)
             counts["remove"] += 1
             continue
 
         if not japanese:
-            logger.warning("  ? SKIP empty japanese field in card: %s", card)
+            logger.warning("  ? SKIP empty japanese field: %s", card)
             continue
 
-        # Deduplicate by Japanese text
         if japanese in seen:
             logger.info("  ~ DEDUP   %s", japanese)
             counts["dedup"] += 1
             continue
         seen.add(japanese)
 
-        # For fix and add: the critique has already written corrected values
-        # into definition/notes/card_type — we use them as-is.
         if action == "fix":
             logger.info("  ✎ FIX     %-40s  %s", japanese, reason)
             counts["fix"] += 1
@@ -340,9 +370,14 @@ def _merge_cards(audited: list[dict], label: str) -> list[dict]:
         else:
             counts["keep"] += 1
 
-        # Strip internal audit fields before returning clean card dicts
+        # Sanitise furigana: if the item has no kanji, blank it out regardless
+        # of what the LLM returned (prevents spurious kana echoes).
+        raw_furigana = str(card.get("furigana", "")).strip()
+        furigana = raw_furigana if _has_kanji(japanese) else ""
+
         clean = {
             "japanese":   japanese,
+            "furigana":   furigana,
             "definition": str(card.get("definition", "")).strip(),
             "card_type":  str(card.get("card_type", "vocab")).strip(),
             "notes":      str(card.get("notes", "")).strip(),
@@ -351,8 +386,7 @@ def _merge_cards(audited: list[dict], label: str) -> list[dict]:
 
     logger.info(
         "  [%s] keep=%d  fix=%d  add=%d  remove=%d  dedup=%d  → %d final",
-        label,
-        counts["keep"], counts["fix"], counts["add"],
+        label, counts["keep"], counts["fix"], counts["add"],
         counts["remove"], counts["dedup"], len(kept),
     )
     return kept
@@ -393,7 +427,6 @@ def process_page(
         audited_cards = _run_critique(b64, mime, label, candidate_cards, context_block)
     except Exception as exc:
         logger.warning("[%s] Critique failed (%s) — using raw extraction.", label, exc)
-        # Fall back: treat all extracted cards as-is
         audited_cards = [{**c, "action": "keep", "reason": ""} for c in candidate_cards]
 
     # ── Step 3: Merge (fully automatic) ──────────────────────────────────────
@@ -410,6 +443,7 @@ def process_page(
         tags = " ".join([base_tag, f"page::{page_tag}", f"type::{item['card_type']}"])
         anki_cards.append(AnkiCard(
             japanese=japanese,
+            furigana=item["furigana"],
             textbook_definition=definition,
             picture=pic_ref,
             additional_notes=item["notes"],
@@ -423,7 +457,15 @@ def process_page(
 # CSV export
 # ─────────────────────────────────────────────────────────────────────────────
 
-CSV_FIELDS = ["Japanese", "Japanese Audio", "Textbook Definition", "Picture", "Additional Notes", "Tags"]
+CSV_FIELDS = [
+    "Japanese",
+    "Furigana",
+    "Japanese Audio",
+    "Textbook Definition",
+    "Picture",
+    "Additional Notes",
+    "Tags",
+]
 
 
 def write_csv(cards: list[AnkiCard], out_path: Path) -> None:
@@ -433,6 +475,7 @@ def write_csv(cards: list[AnkiCard], out_path: Path) -> None:
         for c in cards:
             writer.writerow([
                 c.japanese,
+                c.furigana,
                 "",                       # Japanese Audio — filled later by TTS pipeline
                 c.textbook_definition,
                 c.picture,
@@ -486,7 +529,6 @@ def main() -> None:
     all_cards: list[AnkiCard] = []
     context_summaries: list[str] = []
 
-    # Sequential: each page's summary feeds the next as rolling context
     for i, (b64, mime, label) in enumerate(pages, start=1):
         print(f"── Page {i}/{len(pages)}: {label}")
         result = process_page(
@@ -505,6 +547,8 @@ def main() -> None:
     print("\nFirst 5 cards preview:")
     for c in all_cards[:5]:
         print(f"  {c.japanese!r:<35}  →  {c.textbook_definition!r}")
+        if c.furigana:
+            print(f"    振  {c.furigana}")
         if c.additional_notes:
             print(f"    ℹ  {c.additional_notes}")
         print(f"    🏷  {c.tags}")
