@@ -77,7 +77,7 @@ def translate_sentence(request: TranslationRequest) -> str:
         user_prompt=prompt,
         base64_encoded_image=request.base64_encoded_image,
         image_mime=request.image_mime,
-        validator=assert_latin_extended_only
+        validator=assert_latin_extended_only,
     )
     return prompt_with_retries(prompt_req)
 

@@ -18,8 +18,8 @@ if not MEDIA.exists():
     raise ValueError(f"{MEDIA} does not exist")
 
 OVERWRITE_EXISTS = False
-KOKORO_MODEL_PATH  = os.path.expanduser("~/models/kokoro/kokoro-v1.0.onnx")
-KOKORO_VOICES_PATH = os.path.expanduser("~/models/kokoro/voices-v1.0.bin")
+KOKORO_MODEL_PATH  = os.path.expanduser("./models/kokoro/kokoro-v1.0.onnx")
+KOKORO_VOICES_PATH = os.path.expanduser("./models/kokoro/voices-v1.0.bin")
 
 _kokoro = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
 

@@ -22,7 +22,7 @@ KOKORO_DEFAULT_VOICES: dict[Lang, str] = {
 class KokoroBackend(TTSBackend):
     def __init__(
         self,
-        lang:        Lang = "ja",
+        lang:        Lang = "en",
         model_path:  str  = KOKORO_MODEL_PATH,
         voices_path: str  = KOKORO_VOICES_PATH,
         **kwargs,

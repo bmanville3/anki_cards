@@ -8,3 +8,4 @@ numpy
 huggingface-hub
 pyaudio
 httpx
+pymupdf
