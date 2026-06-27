@@ -5,6 +5,8 @@ from typing import Callable
 from attr import define
 from openai import OpenAI
 
+from src.common.utils import server_available_url
+
 LLM_API_KEY = "EMPTY"
 LLM_MODEL = "google/gemma-4-31B-it"
 LLM_BASE_URL = "http://localhost:9090/v1"
@@ -21,35 +23,39 @@ logger = logging.getLogger(__name__)
 class PromptRequest:
     system_prompt: str
     user_prompt: str
-    base64_encoded_image: str | None = None
-    image_mime: str = "image/jpeg"
+    base_64_images: list[tuple[str, str]] | None = None
     max_retries: int = 3
     validator: Callable[[str], None] | None = None
 
 
-def _build_user_message(user_prompt: str, base64_encoded_image: str | None, image_mime: str = "image/jpeg") -> dict:
-    if base64_encoded_image is None:
+def _build_user_message(user_prompt: str, base_64_images: list[tuple[str, str]] | None = None) -> dict:
+    if not base_64_images:
         return {"role": "user", "content": user_prompt}
+    images = []
+    for image, mime in base_64_images:
+        images.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{image}"}
+        })
     return {
         "role": "user",
         "content": [
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{image_mime};base64,{base64_encoded_image}"}
-            },
+            *images,
             {"type": "text", "text": user_prompt}
         ]
     }
 
 
 def prompt_with_retries(prompt: PromptRequest) -> str:
+    if not server_available_url(url=LLM_BASE_URL):
+        raise ValueError(f"LLM server not avaliable at {LLM_BASE_URL}")
     for _ in range(prompt.max_retries):
         try:
             response = CLIENT.chat.completions.create(
                 model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": prompt.system_prompt},
-                    _build_user_message(prompt.user_prompt, prompt.base64_encoded_image, image_mime=prompt.image_mime),
+                    _build_user_message(prompt.user_prompt, prompt.base_64_images),
                 ],
                 max_tokens=LLM_MAX_TOKENS,
                 temperature=LLM_TEMPERATURE,

@@ -1,8 +1,11 @@
 import base64
 import logging
+import mimetypes
 from pathlib import Path
 import socket
 import unicodedata
+
+import requests
 
 from src.common.types import RawChunk
 
@@ -20,14 +23,14 @@ MIME_TO_LLM_MIME = {
     **MIME_OVERRIDES,
 }
 
-def load_image_b64(path: Path) -> tuple[str, str]:
+def load_image_b64(path: Path, default_mime: str = "image/jpeg") -> tuple[str, str]:
     if not path.exists():
         raise FileNotFoundError(f"Fixture not found: {path}")
     suffix = path.suffix.lower()
-    mime = MIME_TO_LLM_MIME.get(suffix)
+    mime = MIME_TO_LLM_MIME.get(suffix) or mimetypes.guess_type(path)[0]
     if mime is None:
-        mime = MIME_TO_LLM_MIME.get("jpeg")
-        logger.warning("Unsupported image format: %r. Defaulting to %s", suffix, mime)
+        mime = default_mime
+        logger.warning("Unsupported image format: %r. Defaulting to %s", path, mime)
     with open(path, "rb") as fh:
         return base64.b64encode(fh.read()).decode(), mime
 
@@ -86,4 +89,14 @@ def server_available(host: str = "localhost", port: int = 9090) -> bool:
         with socket.create_connection((host, port), timeout=1):
             return True
     except OSError:
+        return False
+
+
+def server_available_url(url: str) -> bool:
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=1)
+        if response.status_code == 405:
+            response = requests.get(url, stream=True, timeout=1)
+        return response.ok
+    except requests.RequestException:
         return False
