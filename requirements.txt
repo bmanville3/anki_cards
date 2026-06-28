@@ -12,3 +12,4 @@ pyaudio
 httpx
 pymupdf
 openai
+beautifulsoup4

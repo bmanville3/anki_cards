@@ -30,13 +30,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Self, cast
 
 import attrs
+from bs4 import BeautifulSoup
 import requests
 from attrs import define
 
 from src.common.utils import load_image_b64
-from src.prompting.prompter import LLM_MODEL, PromptRequest, prompt_batch
+from src.prompting.prompter import LLM_MODEL, LLM_WORKERS, PromptRequest, prompt_batch
 
-TRANSFORM_BATCH_SIZE = 50
+TRANSFORM_BATCH_SIZE = LLM_WORKERS
 DEFAULT_DECK       = "Genki I"
 DEFAULT_MEDIA_PATH = Path('/Users/bmanville3/Library/Application Support/Anki2/User 1/collection.media')
 DEFAULT_RAW_CSV    = Path("raw_cards.csv")
@@ -381,6 +382,49 @@ def bracket_to_reading(text: str) -> str:
 def furigana_to_reading(text: str) -> str:
     return ruby_to_reading(bracket_furigana_to_ruby(text))
 
+def parse_yomitan_glossary(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # --- reading forms only (the row headers, not the kanji column headers) ---
+    forms_table = soup.select_one("li[data-sc-content='forms'] table")
+    readings = []
+    if forms_table:
+        for tr in forms_table.select("tr:not([data-sc-content='forms-header-row'])"):
+            th = tr.find("th")
+            if th:
+                readings.append(th.get_text(strip=True))
+
+    # --- senses, preserving per-sense structure ---
+    senses = []
+    for sense_group in soup.select("li[data-sc-content='sense-group']"):
+        pos = [
+            tag.get_text(strip=True)
+            for tag in sense_group.find_all("span", attrs={"data-sc-content": "part-of-speech-info"}, recursive=False)
+        ]
+
+        for sense in sense_group.select("li[data-sc-content='sense']"):
+            glosses = [
+                li.get_text(strip=True)
+                for li in sense.select("ul[data-sc-content='glossary'] li")
+            ]
+            if glosses:
+                senses.append({"pos": pos, "glosses": glosses})
+
+    return {"readings": readings, "senses": senses}
+
+
+def glossary_to_prompt_text(html: str) -> str:
+    parsed = parse_yomitan_glossary(html)
+    lines = []
+    if parsed["readings"]:
+        lines.append(f"Word: {parsed['readings'][0]}")
+    if len(parsed["readings"]) > 1:
+        lines.append(f"Readings: {', '.join(parsed['readings'])}")
+    for i, sense in enumerate(parsed["senses"], 1):
+        pos_str = "/".join(sense["pos"]) if sense["pos"] else ""
+        gloss_str = "; ".join(sense["glosses"])
+        lines.append(f"  {i}. [{pos_str}] {gloss_str}" if pos_str else f"  {i}. {gloss_str}")
+    return "\n".join(lines)
 
 def build_tags(
     *,
@@ -799,7 +843,7 @@ It should draw on RemarksBack if present or any other information within the car
 def build_wild_prompt(card: Card) -> str:
     expression = card.get_field("expression")
     sentence   = card.get_field("sentence")
-    glossary   = card.get_field("glossary")
+    glossary   = glossary_to_prompt_text(card.get_field("glossary"))
     return f"""\
 SOURCE CARD TYPE: Yomitan
 
