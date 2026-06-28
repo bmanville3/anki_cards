@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Self, cast
 
 import attrs
-import cattrs
 import requests
 from attrs import define
 
@@ -48,18 +47,6 @@ CORE_2000_DECK     = "Core 2000"
 RAW_CSV_FIELDS = ["noteId", "cardType", "fields_json"]
 
 logger = logging.getLogger(__name__)
-
-
-converter = cattrs.Converter()
-
-converter.register_structure_hook(
-    list,
-    lambda v, t: json.loads(v) if isinstance(v, str) else (v or []),
-)
-converter.register_unstructure_hook(
-    list,
-    lambda v: json.dumps(v, ensure_ascii=False),
-)
 
 
 def attr_name_to_anki_field(name: str) -> str:
@@ -228,7 +215,7 @@ JLAB_FIELDS              = {
 
 WILD_CARD_FIELDS         = {
     "expression", "sentence", "furigana", "reading", "glossary",
-    "Note", "audio", "screenshot", "pitch-accent-graphs-jj", "url",
+    "audio", "screenshot", "pitch-accent-graphs-jj", "url",
 }
 
 def _noop(_: "Card") -> None: pass
@@ -358,6 +345,16 @@ class Deck:
         return cls(name, Card.from_notes_info(info))
 
 
+def strip_html_formatting(text: str) -> str:
+    """Remove inline formatting tags (bold, italic, underline) but keep ruby/structure."""
+    text = re.sub(r'</?b>',  '', text)
+    text = re.sub(r'</?i>',  '', text)
+    text = re.sub(r'</?u>',  '', text)
+    text = re.sub(r'</?strong>', '', text)
+    text = re.sub(r'</?em>',     '', text)
+    return text
+
+
 def strip_ruby(text: str) -> str:
     text = re.sub(r'<rt>[^<]*</rt>', '', text)
     text = re.sub(r'</?ruby>', '', text)
@@ -453,22 +450,58 @@ class MasterGenkiCard:
         return master_card_to_anki_fields(self)
 
     def to_csv_row(self) -> dict:
-        d = converter.unstructure(self)
-        d.pop("source_note", None)
-        d["noteId"]           = self.source_note.noteId
-        d["cardType"]         = self.source_note.cardType
-        d["previous_version"] = self.source_note.pretty_string()
-        d["is_new_note"]      = "1" if self.is_new_note else ""
-        return {k: d.get(k, "") for k in _MASTER_CARD_CSV_FIELDS}
+        return {
+            "noteId":              self.source_note.noteId,
+            "cardType":            self.source_note.cardType,
+            "japanese":            self.japanese,
+            "japanese_audio":      json.dumps(self.japanese_audio,  ensure_ascii=False),
+            "furigana":            self.furigana,
+            "reading":             self.reading,
+            "english":             self.english,
+            "english_audio":       self.english_audio,
+            "screenshots":         json.dumps(self.screenshots,     ensure_ascii=False),
+            "screenshot_text":     self.screenshot_text,
+            "explanations":        self.explanations,
+            "additional_notes":    self.additional_notes,
+            "tags":                json.dumps(self.tags,            ensure_ascii=False),
+            "llm_translator":      self.llm_translator,
+            "japanese_audio_model":self.japanese_audio_model,
+            "english_audio_model": self.english_audio_model,
+            "source":              self.source,
+            "previous_version":    self.source_note.pretty_string(),
+            "is_new_note":         "1" if self.is_new_note else "",
+            "target_deck":         self.target_deck,
+        }
 
     @classmethod
     def from_csv_row(cls, row: dict, source_card: Card) -> Self:
-        field_names = {a.name for a in attrs.fields(cls) if a.name != "source_note"}
-        data = {k: v for k, v in row.items() if k in field_names}
-        data["source_note"] = source_card
-        # is_new_note is stored as "1"/"" in CSV, coerce back to bool
-        data["is_new_note"] = data.get("is_new_note", "") == "1"
-        return converter.structure(data, cls)
+        # problems with doing this with cattrs
+        def parse_list(val: str) -> list[str]:
+            stripped = (val or "").strip()
+            if not stripped or stripped == "[]":
+                return []
+            return json.loads(stripped)
+
+        return cls(
+            source_note          = source_card,
+            japanese             = row.get("japanese",             ""),
+            japanese_audio       = parse_list(row.get("japanese_audio",    "[]")),
+            furigana             = row.get("furigana",             ""),
+            reading              = row.get("reading",              ""),
+            english              = row.get("english",              ""),
+            english_audio        = row.get("english_audio",        ""),
+            screenshots          = parse_list(row.get("screenshots",       "[]")),
+            explanations         = row.get("explanations",         ""),
+            additional_notes     = row.get("additional_notes",     ""),
+            screenshot_text      = row.get("screenshot_text",      ""),
+            tags                 = parse_list(row.get("tags",              "[]")),
+            llm_translator       = row.get("llm_translator",       ""),
+            japanese_audio_model = row.get("japanese_audio_model", ""),
+            english_audio_model  = row.get("english_audio_model",  ""),
+            source               = row.get("source",               ""),
+            is_new_note          = row.get("is_new_note", "") == "1",
+            target_deck          = row.get("target_deck",          ""),
+        )
 
 
 def write_raw_csv(cards: list[Card], path: Path) -> None:
@@ -803,6 +836,13 @@ def transform_core2000(card: Card) -> tuple["MasterGenkiCard", "MasterGenkiCard"
     # shared
     caution          = card.get_field("Caution")
     notes_field      = card.get_field("Notes")
+
+    sent_expression = strip_html_formatting(sent_expression)
+    sent_furigana   = strip_html_formatting(sent_furigana)
+    sent_kana       = strip_html_formatting(sent_kana)
+    vocab_kanji     = strip_html_formatting(vocab_kanji)
+    vocab_furigana  = strip_html_formatting(vocab_furigana)
+    vocab_kana      = strip_html_formatting(vocab_kana)
 
     vocab_furigana = bracket_furigana_to_ruby(vocab_furigana) if vocab_furigana else vocab_kanji
     sent_furigana  = bracket_furigana_to_ruby(sent_furigana)  if sent_furigana  else sent_expression
@@ -1148,6 +1188,7 @@ def _add_new_note(mc: "MasterGenkiCard") -> None:
             "modelName": MASTER_MODEL_NAME,
             "fields":    mc.to_anki_fields(),
             "tags":      mc.tags,
+            # "options":   {"allowDuplicate": True},
         },
     )
     if result.get("error"):
@@ -1210,7 +1251,7 @@ def mode_transform(in_csv: Path, out_csv: Path, media_path: Path, sample: int | 
         if card.noteId in already_done:
             continue
         if card.cardType == MASTER_MODEL_NAME:
-            logger.info("Skipping %s — already master", card.noteId)
+            logger.debug("Skipping %s — already master", card.noteId)
             continue
         if card.cardType in NO_LLM_CARD_TYPES:
             pending_no_llm.append(card)
