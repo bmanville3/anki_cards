@@ -5,8 +5,6 @@ from pathlib import Path
 import socket
 import unicodedata
 
-import requests
-
 from src.common.types import RawChunk
 
 logger = logging.getLogger(__name__)
@@ -89,14 +87,4 @@ def server_available(host: str = "localhost", port: int = 9090) -> bool:
         with socket.create_connection((host, port), timeout=1):
             return True
     except OSError:
-        return False
-
-
-def server_available_url(url: str) -> bool:
-    try:
-        response = requests.head(url, allow_redirects=True, timeout=1)
-        if response.status_code == 405:
-            response = requests.get(url, stream=True, timeout=1)
-        return response.ok
-    except requests.RequestException:
         return False

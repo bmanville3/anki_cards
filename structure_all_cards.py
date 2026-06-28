@@ -1,17 +1,21 @@
 """
-anki_transform.py — three-mode Anki card transformation pipeline
+# 1. Local — export deck to CSV + copy only referenced media
+python structure_all_cards.py export \
+  --deck "Genki I" \
+  --out raw_cards.csv \
+  --media-src "/Users/bmanville3/Library/Application Support/Anki2/User 1/collection.media" \
+  --media-out ./media
 
-Modes:
-  export    Pull cards from AnkiConnect → write raw_cards.csv
-  transform Read raw_cards.csv → run LLM → write transformed_cards.csv
-  import    Read transformed_cards.csv → push to AnkiConnect (in-place update)
+# 2. Server — transform (upload raw_cards.csv + ./media/ first)
+python structure_all_cards.py transform \
+  --in raw_cards.csv \
+  --out transformed_cards.csv \
+  --media ./media
 
-Typical remote workflow:
-  [local]  python anki_transform.py export   --deck "Genki I" --out raw_cards.csv
-           # upload raw_cards.csv + media folder to Google Drive
-  [server] python anki_transform.py transform --in raw_cards.csv --out transformed_cards.csv --media ./media
-           # download transformed_cards.csv from Google Drive
-  [local]  python anki_transform.py import   --in transformed_cards.csv
+# 3. Local — import back into Anki (download transformed_cards.csv first)
+python structure_all_cards.py import \
+  --in transformed_cards.csv \
+  --no-dry-run
 """
 
 import argparse
@@ -310,6 +314,14 @@ class Deck:
 # Master card
 # ─────────────────────────────────────────────────────────────────────────────
 
+def strip_ruby(text: str) -> str:
+    """Remove HTML ruby tags, keeping only the base text (not the <rt> readings)."""
+    # Remove <rt>...</rt> content entirely
+    text = re.sub(r'<rt>[^<]*</rt>', '', text)
+    # Remove remaining ruby tags
+    text = re.sub(r'</?ruby>', '', text)
+    return text
+
 @define
 class MasterGenkiCard:
     source_note:      Card
@@ -324,11 +336,16 @@ class MasterGenkiCard:
     additional_notes: str       = ""
     screenshot_text:  str       = ""
     tags:             list[str] = None
+    llm_translator:   str       = ""
+    japanese_audio_model: str   = ""
+    english_audio_model: str    = ""
+    source: str                 = ""
 
     def __attrs_post_init__(self):
         if self.screenshots    is None: self.screenshots    = []
         if self.tags           is None: self.tags           = []
         if self.japanese_audio is None: self.japanese_audio = []
+        self.japanese = strip_ruby(self.japanese)
 
     def to_anki_fields(self) -> dict[str, str]:
         return {
@@ -343,6 +360,7 @@ class MasterGenkiCard:
             "Explanations":     self.explanations,
             "Additional Notes": self.additional_notes,
             "Previous Version": self.source_note.pretty_string(),
+            "Tags":             " ".join(self.tags),
         }
 
     def to_csv_row(self) -> dict:
@@ -362,6 +380,10 @@ class MasterGenkiCard:
             "additional_notes":self.additional_notes,
             "tags":            json.dumps(self.tags,            ensure_ascii=False),
             "previous_version":self.source_note.pretty_string(),
+            "llm_translator": self.llm_translator,
+            "japanese_audio_model": self.japanese_audio_model,
+            "english_audio_model": self.english_audio_model,
+            "source": self.source,
         }
 
     @classmethod
@@ -380,6 +402,10 @@ class MasterGenkiCard:
             explanations     = row.get("explanations",     ""),
             additional_notes = row.get("additional_notes", ""),
             tags             = json.loads(row.get("tags",             "[]")),
+            llm_translator = row.get("llm_translator", ""),
+            japanese_audio_model = row.get("japanese_audio_model", ""),
+            english_audio_model = row.get("english_audio_model", ""),
+            source = row.get("source", ""),
         )
 
 
@@ -458,9 +484,34 @@ Your job is to convert a legacy Anki flashcard into a standardised "Master Genki
 The Master Genki Card has the following fields:
 
   japanese          - The Japanese text: a word, phrase, or full sentence.
-  furigana          - The same text with furigana inserted above every kanji using
-                      the HTML ruby format: <ruby>漢字<rt>かんじ</rt></ruby>
+  furigana          - The japanese text with furigana inserted above every kanji using
+                      the HTML ruby format. Add furigana ONLY above kanji characters,
+                      never above hiragana or katakana (they are already readable).
+
+                      Examples:
+                        Input:  日本語
+                        Output: <ruby>日本語<rt>にほんご</rt></ruby>
+
+                        Input:  食べる
+                        Output: <ruby>食<rt>た</rt></ruby>べる
+
+                        Input:  私は学生です
+                        Output: <ruby>私<rt>わたし</rt></ruby>は<ruby>学生<rt>がくせい</rt></ruby>です
+
+                        Input:  アメリカに行きました
+                        Output: アメリカに<ruby>行<rt>い</rt></ruby>きました
+
+                        Input:  飲み物
+                        Output: <ruby>飲<rt>の</rt></ruby>み<ruby>物<rt>もの</rt></ruby>
+
+                      Key rules:
+                      - Each kanji or kanji compound gets its own ruby tag
+                      - Hiragana and katakana pass through unchanged, no ruby tag
+                      - Okurigana (the hiragana attached to a kanji verb/adjective)
+                        stays outside the ruby tag: <ruby>食<rt>た</rt></ruby>べる
                       Furigana should be added for both full sentences and vocab cards.
+                      If a vocab card is pure hiragana or katakana, just place the
+                      hiragana or katakana in this field with no ruby tags.
   reading           - The full kana reading (hiragana or katakana) of the item,
                       with no kanji. Only necessary for vocabulary cards.
   english           - The English meaning or translation.
@@ -663,22 +714,6 @@ def _ensure_model_fields(field_names: list[str]) -> None:
 
 def _update_note_in_place(mc: MasterGenkiCard) -> None:
     note_id       = int(mc.source_note.noteId)
-    current_model = mc.source_note.cardType
-
-    if current_model != MASTER_MODEL_NAME:
-        old_fields_result = invoke("modelFieldNames", modelName=current_model)
-        old_fields        = old_fields_result.get("result") or []
-        result = invoke(
-            "changeNotesType",
-            noteIds=[note_id],
-            oldModelName=None,
-            newModelName=MASTER_MODEL_NAME,
-            fieldMapping={old: "" for old in old_fields},
-        )
-        if result.get("error"):
-            print(f"  ✗ changeNotesType failed for {note_id}: {result['error']}")
-            return
-
     result = invoke("updateNoteFields", note={"id": note_id, "fields": mc.to_anki_fields()})
     if result.get("error"):
         print(f"  ✗ updateNoteFields failed for {note_id}: {result['error']}")
@@ -846,7 +881,7 @@ def mode_import(in_csv: Path, dry_run: bool) -> None:
     _ensure_model_fields([
         "Japanese", "Japanese Audio", "Furigana", "Reading",
         "English", "English Audio", "Screenshots", "Screenshot Text",
-        "Explanations", "Additional Notes", "Previous Version",
+        "Explanations", "Additional Notes", "Previous Version", "Tags",
     ])
     for mc in master_cards:
         _update_note_in_place(mc)
@@ -902,24 +937,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-# real fast use case
-
-# # 1. Local — export deck to CSV + copy only referenced media
-# python anki_transform.py export \
-#   --deck "Genki I" \
-#   --out raw_cards.csv \
-#   --media-src "/Users/bmanville3/Library/Application Support/Anki2/User 1/collection.media" \
-#   --media-out ./media
-
-# # 2. Server — transform (upload raw_cards.csv + ./media/ first)
-# python anki_transform.py transform \
-#   --in raw_cards.csv \
-#   --out transformed_cards.csv \
-#   --media ./media
-
-# # 3. Local — import back into Anki (download transformed_cards.csv first)
-# python anki_transform.py import \
-#   --in transformed_cards.csv \
-#   --no-dry-run

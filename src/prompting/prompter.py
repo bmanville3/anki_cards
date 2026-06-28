@@ -5,14 +5,13 @@ from typing import Callable
 from attr import define
 from openai import OpenAI
 
-from src.common.utils import server_available_url
-
-LLM_API_KEY = "EMPTY"
-LLM_MODEL = "google/gemma-4-31B-it"
-LLM_BASE_URL = "http://localhost:9090/v1"
+LLM_API_KEY    = "ollama"
+LLM_MODEL      = "gemma4:26b"
+LLM_BASE_URL   = "http://localhost:11434/v1/"
 LLM_MAX_TOKENS = 8192
 LLM_TEMPERATURE = 0.1
-LLM_WORKERS = 8
+LLM_WORKERS    = 2
+
 
 CLIENT = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 
@@ -47,8 +46,6 @@ def _build_user_message(user_prompt: str, base_64_images: list[tuple[str, str]] 
 
 
 def prompt_with_retries(prompt: PromptRequest) -> str:
-    if not server_available_url(url=LLM_BASE_URL):
-        raise ValueError(f"LLM server not avaliable at {LLM_BASE_URL}")
     for _ in range(prompt.max_retries):
         try:
             response = CLIENT.chat.completions.create(
