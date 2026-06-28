@@ -43,6 +43,7 @@ DEFAULT_MEDIA_PATH = Path('/Users/bmanville3/Library/Application Support/Anki2/U
 DEFAULT_RAW_CSV    = Path("raw_cards.csv")
 DEFAULT_OUT_CSV    = Path("transformed_cards.csv")
 MASTER_MODEL_NAME  = "Master Card"
+CORE_2000_DECK     = "Core 2000"
 
 RAW_CSV_FIELDS = ["noteId", "cardType", "fields_json"]
 
@@ -72,7 +73,7 @@ def anki_field_to_attr_name(field: str) -> str:
 def master_card_to_anki_fields(mc: "MasterGenkiCard") -> dict[str, str]:
     result = {}
     for a in attrs.fields(MasterGenkiCard):
-        if a.name == "source_note":
+        if a.name in ("source_note", "tags", "is_new_note", "target_deck"):
             continue
         val = getattr(mc, a.name)
         anki_name = attr_name_to_anki_field(a.name)
@@ -82,7 +83,6 @@ def master_card_to_anki_fields(mc: "MasterGenkiCard") -> dict[str, str]:
             result[anki_name] = str(val) if val else ""
     result["Previous Version"] = mc.source_note.pretty_string()
     return result
-
 
 
 def invoke(action: str, **params) -> dict:
@@ -369,7 +369,7 @@ def bracket_furigana_to_ruby(text: str) -> str:
 
 
 def strip_brackets(text: str) -> str:
-    return strip_ruby((bracket_furigana_to_ruby(text)))
+    return strip_ruby(bracket_furigana_to_ruby(text))
 
 
 def ruby_to_reading(text: str) -> str:
@@ -409,6 +409,10 @@ _MASTER_CARD_CSV_FIELDS = [
     "llm_translator", "japanese_audio_model", "english_audio_model",
     "source",
     "previous_version",
+    # Core 2000 split: sentence cards need to be inserted rather than updated.
+    # We track this in the CSV so mode_import knows what to do.
+    "is_new_note",   # "1" if this row should be addNote'd, "" if updateNoteFields
+    "target_deck",   # deck name for addNote (only used when is_new_note == "1")
 ]
 
 _ANKI_FIELD_NAMES = [
@@ -416,7 +420,6 @@ _ANKI_FIELD_NAMES = [
     "English", "English Audio",
     "Screenshots", "Screenshot Text",
     "Explanations", "Additional Notes",
-    "Tags",
     "Previous Version",
 ]
 
@@ -439,10 +442,12 @@ class MasterGenkiCard:
     japanese_audio_model: str       = ""
     english_audio_model:  str       = ""
     source:               str       = ""
+    # Import routing — not an Anki field
+    is_new_note:          bool      = False
+    target_deck:          str       = ""
 
     def __attrs_post_init__(self):
         self.japanese = strip_ruby(self.japanese)
-
 
     def to_anki_fields(self) -> dict[str, str]:
         return master_card_to_anki_fields(self)
@@ -453,6 +458,7 @@ class MasterGenkiCard:
         d["noteId"]           = self.source_note.noteId
         d["cardType"]         = self.source_note.cardType
         d["previous_version"] = self.source_note.pretty_string()
+        d["is_new_note"]      = "1" if self.is_new_note else ""
         return {k: d.get(k, "") for k in _MASTER_CARD_CSV_FIELDS}
 
     @classmethod
@@ -460,6 +466,8 @@ class MasterGenkiCard:
         field_names = {a.name for a in attrs.fields(cls) if a.name != "source_note"}
         data = {k: v for k, v in row.items() if k in field_names}
         data["source_note"] = source_card
+        # is_new_note is stored as "1"/"" in CSV, coerce back to bool
+        data["is_new_note"] = data.get("is_new_note", "") == "1"
         return converter.structure(data, cls)
 
 
@@ -513,7 +521,6 @@ def read_transformed_csv(path: Path) -> list["MasterGenkiCard"]:
                 logger.warning("Skipping malformed row (noteId=%s): %s", note_id, e)
     logger.info(f"Read {len(master_cards)} transformed cards ← {path}")
     return master_cards
-
 
 
 BASE_SYSTEM_PROMPT = f"""\
@@ -578,15 +585,15 @@ Rules you must always follow:
 def _base_sentence_prompt(card_name: str, front_content: str, additional_rules: list[str] | None = None) -> str:
     rules = [
         "No markdown fences. No extra explanations.",
-        "The card will likely contain everything you need to do this \
-        or may already be a one-line English summary. In this case, \
-        pull only from the card - do not add anything. If the card \
-        does NOT contain enough information to produce a one-line \
-        summary, you may produce your own one-line summary. Make \
-        it concise and literal.",
-        "The \"one-line\" summary should always be the answer to the front.",
+        "The card will likely contain everything you need to do this "
+        "or may already be a one-line English summary. In this case, "
+        "pull only from the card - do not add anything. If the card "
+        "does NOT contain enough information to produce a one-line "
+        "summary, you may produce your own one-line summary. Make "
+        "it concise and literal.",
+        'The "one-line" summary should always be the answer to the front.',
     ]
-    rules.extend(additional_rules)
+    rules.extend(additional_rules or [])
     str_rules = ""
     for i, rule in enumerate(rules):
         str_rules += f"\n{i+1}. {rule}"
@@ -610,11 +617,11 @@ JLAB_SYSTEM_PROMPT = _base_sentence_prompt(
     "Japanese Like a Breeze (JLab)",
     "a Japanese sentence",
     [
-        "Jlab often has words in '[]'.\
-        This means that the words are implied \
-        but not explicitly said. Do NOT add these \
-        words into your summary. If jlab considers \
-        them implied by adding '[]', ignore them."
+        "Jlab often has words in '[]'. "
+        "This means that the words are implied "
+        "but not explicitly said. Do NOT add these "
+        "words into your summary. If jlab considers "
+        "them implied by adding '[]', ignore them."
     ],
 )
 WILD_SYSTEM_PROMPT = _base_sentence_prompt("Yomitan", "a Japanese vocab word/expression and a context sentence")
@@ -640,8 +647,8 @@ def _parse_llm_json(raw: str) -> dict:
 
 
 def _parse_llm_sentence(raw: str) -> str:
-    clean   = re.sub(r'^```[a-zA-Z]*\n?', '', raw.strip())
-    clean   = re.sub(r'\n?```$', '', clean)
+    clean = re.sub(r'^```[a-zA-Z]*\n?', '', raw.strip())
+    clean = re.sub(r'\n?```$', '', clean)
     return clean
 
 
@@ -740,8 +747,8 @@ Mapping guidance:
 
 
 def build_jlab_prompt(card: Card) -> str:
-    kanji    = card.get_field("Jlab-Kanji")
-    remarks  = card.get_field("RemarksBack")
+    kanji   = card.get_field("Jlab-Kanji")
+    remarks = card.get_field("RemarksBack")
     return f"""\
 SOURCE CARD TYPE: JLab (Japanese Like a Breeze)
 
@@ -757,9 +764,9 @@ It should draw on RemarksBack if present or any other information within the car
 
 
 def build_wild_prompt(card: Card) -> str:
-    expression    = card.get_field("expression")
-    sentence = card.get_field("sentence")
-    glossary = card.get_field("glossary")
+    expression = card.get_field("expression")
+    sentence   = card.get_field("sentence")
+    glossary   = card.get_field("glossary")
     return f"""\
 SOURCE CARD TYPE: Yomitan
 
@@ -768,7 +775,7 @@ Context sentence: {sentence}
 Yomitan dictionary: {glossary}
 
 Produce a one-line English translation/answer for the front of the card.
-It should from the Yomitan dictionary and answer the Japanese vocab/expression.
+It should draw from the Yomitan dictionary and answer the Japanese vocab/expression.
 
 --- FULL CARD ---
 {card.pretty_string()}
@@ -776,48 +783,42 @@ It should from the Yomitan dictionary and answer the Japanese vocab/expression.
 
 
 def transform_core2000(card: Card) -> tuple["MasterGenkiCard", "MasterGenkiCard"]:
-    # vocab part
-    vocab_kanji          = card.get_field("Vocabulary-Kanji")
+    # vocab
+    vocab_kanji      = card.get_field("Vocabulary-Kanji")
     vocab_furigana   = card.get_field("Vocabulary-Furigana")
-    vocab_kana           = card.get_field("Vocabulary-Kana")
-    vocab_english        = card.get_field("Vocabulary-English")
-    vocab_audio    = card.get_field("Vocabulary-Audio")
-    vocab_pos            = card.get_field("Vocabulary-Pos")
-    vocab_freq           = card.get_field("Frequency")
-    vocab_eng_audio = card.get_field("English-Word-Audio")
-
-    # sentence part
-    sent_eng_audio = card.get_field("English-Sentence-Audio")
-    sent_eng_gemma4         = card.get_field("Gemma4")
-    sent_eng_original   = card.get_field("Sentence-English")
-    sent_expression     = card.get_field("Expression")
-    sent_furigana     = card.get_field("Reading")
-    sent_kana      = card.get_field("Sentence-Kana")
-    sent_audio     = card.get_field("Sentence-Audio")
-
+    vocab_kana       = card.get_field("Vocabulary-Kana")
+    vocab_english    = card.get_field("Vocabulary-English")
+    vocab_audio      = card.get_field("Vocabulary-Audio")
+    vocab_pos        = card.get_field("Vocabulary-Pos")
+    vocab_freq       = card.get_field("Frequency")
+    vocab_eng_audio  = card.get_field("English-Word-Audio")
+    # sentence
+    sent_eng_audio   = card.get_field("English-Sentence-Audio")
+    sent_eng_gemma4  = card.get_field("Gemma4")
+    sent_eng_orig    = card.get_field("Sentence-English")
+    sent_expression  = card.get_field("Expression")
+    sent_furigana    = card.get_field("Reading")
+    sent_kana        = card.get_field("Sentence-Kana")
+    sent_audio       = card.get_field("Sentence-Audio")
     # shared
-    caution        = card.get_field("Caution")
-    notes_field    = card.get_field("Notes")
-
+    caution          = card.get_field("Caution")
+    notes_field      = card.get_field("Notes")
 
     vocab_furigana = bracket_furigana_to_ruby(vocab_furigana) if vocab_furigana else vocab_kanji
-    sent_furigana = bracket_furigana_to_ruby(sent_furigana) if sent_furigana else sent_expression
+    sent_furigana  = bracket_furigana_to_ruby(sent_furigana)  if sent_furigana  else sent_expression
 
     vocab_explanations = []
-    if vocab_pos:     vocab_explanations.append(f"Part of speech: {vocab_pos}")
-    if caution: vocab_explanations.append(f"Caution: {caution}")
-    if vocab_freq:    vocab_explanations.append(f"Frequency rank: {vocab_freq}")
-    if notes_field: vocab_explanations.append(notes_field)
+    if vocab_pos:    vocab_explanations.append(f"Part of speech: {vocab_pos}")
+    if caution:      vocab_explanations.append(f"Caution: {caution}")
+    if vocab_freq:   vocab_explanations.append(f"Frequency rank: {vocab_freq}")
+    if notes_field:  vocab_explanations.append(notes_field)
 
-    sentence_additional_notes = []
-    if caution: sentence_additional_notes.append(f"Caution: {caution}")
-    if notes_field: sentence_additional_notes.append(notes_field)
-    if sent_eng_original: sentence_additional_notes.append(f"Original translation: {sent_eng_original}")
+    sentence_additional = []
+    if caution:       sentence_additional.append(f"Caution: {caution}")
+    if notes_field:   sentence_additional.append(notes_field)
+    if sent_eng_orig: sentence_additional.append(f"Original translation: {sent_eng_orig}")
 
-    base_tags = build_tags(
-        source_deck  = "Core 2000",
-        extra        = ["llm::gemma4_31b"],
-    )
+    base_tags = build_tags(source_deck="Core 2000", extra=["llm::gemma4_31b"])
 
     vocab_card = MasterGenkiCard(
         source_note          = card,
@@ -836,6 +837,8 @@ def transform_core2000(card: Card) -> tuple["MasterGenkiCard", "MasterGenkiCard"
         japanese_audio_model = "core2000_bundled",
         english_audio_model  = "kokoro_af_heart",
         source               = "Core 2000",
+        is_new_note          = False,
+        target_deck          = "",
     )
 
     sent_card = MasterGenkiCard(
@@ -848,37 +851,39 @@ def transform_core2000(card: Card) -> tuple["MasterGenkiCard", "MasterGenkiCard"
         english_audio        = sent_eng_audio,
         screenshots          = [],
         explanations         = f"Vocabulary in context: {vocab_kanji} ({vocab_english})",
-        additional_notes     = "\n".join(sentence_additional_notes),
+        additional_notes     = "\n".join(sentence_additional),
         screenshot_text      = "",
         tags                 = base_tags + ["type::sentence"],
         llm_translator       = "gemma4-31b",
         japanese_audio_model = "core2000_bundled",
         english_audio_model  = "kokoro_af_heart",
         source               = "Core 2000",
+        is_new_note          = True,
+        target_deck          = CORE_2000_DECK,
     )
 
     return (vocab_card, sent_card)
 
 
 def transform_video(card: Card) -> "MasterGenkiCard":
-    japanese          = card.get_field("Text")
-    japanese_audio    = card.get_field("Audio")
-    image             = card.get_field("Image")
-    natural_english   = card.get_field("NaturalTranslation")
-    literal_english   = card.get_field("LiteralTranslation")
-    english_audio     = card.get_field("TTSAudio")
-    furigana_raw      = card.get_field("Furigana")
-    word_gloss        = card.get_field("WordGloss")
-    source_time       = card.get_field("TimeCode")
-    source_file       = card.get_field("Source")
-    notes             = card.get_field("Notes")
+    japanese        = card.get_field("Text")
+    japanese_audio  = card.get_field("Audio")
+    image           = card.get_field("Image")
+    natural_english = card.get_field("NaturalTranslation")
+    literal_english = card.get_field("LiteralTranslation")
+    english_audio   = card.get_field("TTSAudio")
+    furigana_raw    = card.get_field("Furigana")
+    word_gloss      = card.get_field("WordGloss")
+    source_time     = card.get_field("TimeCode")
+    source_file     = card.get_field("Source")
+    notes           = card.get_field("Notes")
 
     source = f"Japanese Video Deck: {source_file} {source_time}"
 
     additional = []
-    if literal_english:     additional.append(f"Literal: {literal_english}")
-    if source_file: additional.append(f"Source: {source_file}")
-    if notes:       additional.append(notes)
+    if literal_english: additional.append(f"Literal: {literal_english}")
+    if source_file:     additional.append(f"Source: {source_file}")
+    if notes:           additional.append(notes)
 
     return MasterGenkiCard(
         source_note          = card,
@@ -905,10 +910,6 @@ def transform_video(card: Card) -> "MasterGenkiCard":
 
 
 def transform_wild(card: Card, english: str) -> "MasterGenkiCard":
-    """
-    Wild Cards (Yomitan) → MasterGenkiCard.
-    Sentence preserved in additional_notes; no LLM needed.
-    """
     expression   = card.get_field("expression")
     sentence     = card.get_field("sentence")
     furigana_raw = card.get_field("furigana")
@@ -922,8 +923,8 @@ def transform_wild(card: Card, english: str) -> "MasterGenkiCard":
     furigana_html = bracket_furigana_to_ruby(furigana_raw)
 
     additional_parts = []
-    if pitch_accent:     additional_parts.append(f"{pitch_accent}")
-    if sentence: additional_parts.append(f"Example sentence: {sentence}")
+    if pitch_accent: additional_parts.append(f"{pitch_accent}")
+    if sentence:     additional_parts.append(f"Example sentence: {sentence}")
 
     return MasterGenkiCard(
         source_note          = card,
@@ -950,30 +951,29 @@ def transform_wild(card: Card, english: str) -> "MasterGenkiCard":
 
 
 def transform_jlab(card: Card, english: str) -> "MasterGenkiCard":
-    source = card.get_field("Source")
+    source         = card.get_field("Source")
     japanese_audio = card.get_field("Audio")
-    image = card.get_field("Image")
-    remarks_front = card.get_field("RemarksFront")
-    explanation = card.get_field("RemarksBack")
-    question_link = card.get_field("QuestionLink")
-    references = card.get_field("References")
-    furigana = card.get_field("Other-Front")
-    other_back = card.get_field("Other-Back")
-    japanese = card.get_field("Jlab-Kanji")
-    spaced_japanese = card.get_field("Jlab-KanjiSpaced")
-    reading = card.get_field("Jlab-Hiragana")
-    romaji = card.get_field("Jlab-ListeningFront")
+    image          = card.get_field("Image")
+    remarks_front  = card.get_field("RemarksFront")
+    explanation    = card.get_field("RemarksBack")
+    question_link  = card.get_field("QuestionLink")
+    references     = card.get_field("References")
+    furigana       = card.get_field("Other-Front")
+    other_back     = card.get_field("Other-Back")
+    japanese       = card.get_field("Jlab-Kanji")
+    spaced_jp      = card.get_field("Jlab-KanjiSpaced")
+    reading        = card.get_field("Jlab-Hiragana")
+    romaji         = card.get_field("Jlab-ListeningFront")
 
     furigana = bracket_furigana_to_ruby(furigana)
 
     additional_parts = []
-    if romaji: additional_parts.append(f"Romaji: {romaji}")
-    if spaced_japanese: additional_parts.append(f"Spaced: {spaced_japanese}")
+    if romaji:        additional_parts.append(f"Romaji: {romaji}")
+    if spaced_jp:     additional_parts.append(f"Spaced: {spaced_jp}")
     if remarks_front: additional_parts.append(f"Remarks front: {remarks_front}")
     if question_link: additional_parts.append(f"Question link: {question_link}")
-    if references: additional_parts.append(f"References: {references}")
-    if other_back: additional_parts.append(f"Other back: {other_back}")
-
+    if references:    additional_parts.append(f"References: {references}")
+    if other_back:    additional_parts.append(f"Other back: {other_back}")
 
     return MasterGenkiCard(
         source_note          = card,
@@ -1002,13 +1002,15 @@ def transform_jlab(card: Card, english: str) -> "MasterGenkiCard":
 def build_prompt_request_for_card(card: Card, media_path: Path) -> PromptRequest:
     ct = card.cardType
     if ct not in LLM_CARD_TYPES:
-        raise ValueError(f"{ct} not in {LLM_CARD_TYPES}")
+        raise ValueError(f"{ct!r} not in {LLM_CARD_TYPES}")
 
     split_card = card.split_fields()
     split_card.map_ugly_ids_to_pretty()
     sct = split_card.cardType
+    if sct not in LLM_CARD_TYPES:
+        raise ValueError(f"{sct} not in {LLM_CARD_TYPES}")
 
-    if ct in ("JlabNote-JlabConverted-1",):
+    if ct == "JlabNote-JlabConverted-1":
         return PromptRequest(
             system_prompt  = JLAB_SYSTEM_PROMPT,
             user_prompt    = build_jlab_prompt(split_card),
@@ -1016,7 +1018,7 @@ def build_prompt_request_for_card(card: Card, media_path: Path) -> PromptRequest
             validator      = _parse_llm_sentence,
         )
     
-    if ct in ("Wild Cards",):
+    if ct == "Wild Cards":
         return PromptRequest(
             system_prompt  = WILD_SYSTEM_PROMPT,
             user_prompt    = build_wild_prompt(split_card),
@@ -1042,29 +1044,23 @@ def build_prompt_request_for_card(card: Card, media_path: Path) -> PromptRequest
 
 
 def _llm_card_tags(card: Card) -> list[str]:
-    """Map source card type to tags for LLM-processed cards."""
     ct = card.cardType
-
     if "Genki Practice Card" in ct:
         return build_tags(source_deck="Genki I", card_subtype="sentence")
     if "Genki Vocab Card" in ct:
         return build_tags(source_deck="Genki I", card_subtype="vocab-sentence")
     if "Basic" in ct:
         return build_tags(source_deck="Genki I", card_subtype="vocab-sentence")
-    
     if "Jlab" in ct:
         return build_tags(source_deck="Jlab's beginner course", card_subtype="sentence")
-    
     if "Core 2000" in ct:
         return build_tags(source_deck="Core 2000", card_subtype="vocab-sentence")
-    
     if "Wild" in ct:
         return build_tags(source_deck="In the Wild", card_subtype="vocab")
-    
     if "Japanese Video Sentence Cards" in ct:
         return build_tags(source_deck="Japanese Video Deck", card_subtype="sentence")
+    raise ValueError(f"Unsupported llm card type: '{ct}'")
 
-    return ValueError(f"Unsupported llm card type: '{ct}'")
 
 NO_LLM_CARD_TYPES = {"Core 2000", "Japanese Video Sentence Cards+"}
 LLM_CARD_TYPES    = {"Basic", "Basic (split)", "Genki Practice Card", "Genki Vocab Card",
@@ -1075,12 +1071,10 @@ def assemble_master_card_from_llm(card: Card, llm_raw: str) -> "MasterGenkiCard"
     card.map_pretty_ids_to_ugly()
     if "Jlab" in card.cardType:
         return transform_jlab(card, _parse_llm_sentence(llm_raw))
-    
     if "Wild" in card.cardType:
-        return transform_wild(card,  _parse_llm_sentence(llm_raw))
-    
-    data  = _parse_llm_json(llm_raw)
+        return transform_wild(card, _parse_llm_sentence(llm_raw))
 
+    data = _parse_llm_json(llm_raw)
     return MasterGenkiCard(
         source_note          = card,
         japanese             = data.get("japanese",         ""),
@@ -1104,7 +1098,7 @@ def assemble_master_card_from_llm(card: Card, llm_raw: str) -> "MasterGenkiCard"
 def transform_no_llm(card: Card) -> Iterable["MasterGenkiCard"]:
     ct = card.cardType
     if ct not in NO_LLM_CARD_TYPES:
-        raise ValueError(f"{ct} not in {NO_LLM_CARD_TYPES}")
+        raise ValueError(f"{ct!r} not in NO_LLM_CARD_TYPES")
     if ct == "Core 2000":
         return transform_core2000(card)
     if ct == "Japanese Video Sentence Cards+":
@@ -1120,9 +1114,8 @@ def _ensure_model_fields(field_names: list[str]) -> None:
             r = invoke("modelFieldAdd", modelName=MASTER_MODEL_NAME, fieldName=field, index=len(current))
             if r.get("error"):
                 raise ValueError(f"Could not add field '{field}': {r['error']}")
-            else:
-                current.add(field)
-                logger.info(f"  + Added field '{field}' to {MASTER_MODEL_NAME}")
+            current.add(field)
+            logger.info(f"  + Added field '{field}' to {MASTER_MODEL_NAME}")
 
 
 def _update_note_in_place(mc: "MasterGenkiCard") -> None:
@@ -1130,8 +1123,37 @@ def _update_note_in_place(mc: "MasterGenkiCard") -> None:
     result  = invoke("updateNoteFields", note={"id": note_id, "fields": mc.to_anki_fields()})
     if result.get("error"):
         logger.error(f"  ✗ updateNoteFields failed for {note_id}: {result['error']}")
+        return
+
+    info = invoke("notesInfo", notes=[note_id])
+    if info.get("error"):
+        logger.error(f"  ✗ notesInfo failed for {note_id}: {result['error']}")
+        return
+    existing_tags = set(info.get("result", [{}])[0].get("tags", []))
+    merged_tags   = existing_tags | set(mc.tags)
+    result = invoke("updateNoteTags", note=note_id, tags=" ".join(sorted(merged_tags)))
+    if result.get("error"):
+        logger.error(f"  ✗ updateNoteTags failed for {note_id}: {result['error']}")
+        return
+
+    logger.info(f"  ✓ Updated {note_id}")
+
+
+def _add_new_note(mc: "MasterGenkiCard") -> None:
+    """Insert a brand-new note (used for Core 2000 sentence cards)."""
+    result = invoke(
+        "addNote",
+        note={
+            "deckName":  mc.target_deck,
+            "modelName": MASTER_MODEL_NAME,
+            "fields":    mc.to_anki_fields(),
+            "tags":      mc.tags,
+        },
+    )
+    if result.get("error"):
+        logger.error(f"  ✗ addNote failed for sentence of {mc.source_note.noteId}: {result['error']}")
     else:
-        logger.info(f"  ✓ Updated {note_id}")
+        logger.info(f"  ✓ Added new sentence note (parent {mc.source_note.noteId}) → new id {result.get('result')}")
 
 
 def _copy_referenced_media(cards: list[Card], media_src: Path, media_dst: Path) -> None:
@@ -1256,14 +1278,24 @@ def mode_transform(in_csv: Path, out_csv: Path, media_path: Path, sample: int | 
 def mode_import(in_csv: Path, dry_run: bool) -> None:
     master_cards = read_transformed_csv(in_csv)
     if dry_run:
-        logger.info(f"DRY RUN — {len(master_cards)} cards (pass --no-dry-run to commit)")
+        updates = [mc for mc in master_cards if not mc.is_new_note]
+        inserts = [mc for mc in master_cards if mc.is_new_note]
+        logger.info(
+            f"DRY RUN — {len(master_cards)} total: "
+            f"{len(updates)} updates, {len(inserts)} new inserts "
+            f"(pass --no-dry-run to commit)"
+        )
         for mc in master_cards[:5]:
-            logger.info(f"  {mc.source_note.noteId}: {mc.japanese[:50]}")
+            action = "ADD" if mc.is_new_note else "UPD"
+            logger.info(f"  [{action}] {mc.source_note.noteId}: {mc.japanese[:50]}")
         return
 
     _ensure_model_fields(_ANKI_FIELD_NAMES)
     for mc in master_cards:
-        _update_note_in_place(mc)
+        if mc.is_new_note:
+            _add_new_note(mc)
+        else:
+            _update_note_in_place(mc)
 
 
 def main() -> None:
