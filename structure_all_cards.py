@@ -24,63 +24,77 @@ import json
 import logging
 import random
 import re
+import shutil
 import sys
 from pathlib import Path
-from typing import Any, Callable, Self, cast
+from typing import Any, Callable, Iterable, Self, cast
 
+import attrs
+import cattrs
 import requests
 from attrs import define
-import attrs
 
 from src.common.utils import load_image_b64
-from src.prompting.prompter import PromptRequest, prompt_batch
+from src.prompting.prompter import LLM_MODEL, PromptRequest, prompt_batch
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Config / defaults  (override via CLI args)
-# ─────────────────────────────────────────────────────────────────────────────
-
+TRANSFORM_BATCH_SIZE = 50
 DEFAULT_DECK       = "Genki I"
 DEFAULT_MEDIA_PATH = Path('/Users/bmanville3/Library/Application Support/Anki2/User 1/collection.media')
 DEFAULT_RAW_CSV    = Path("raw_cards.csv")
 DEFAULT_OUT_CSV    = Path("transformed_cards.csv")
-MASTER_MODEL_NAME  = "Master Genki Card"
+MASTER_MODEL_NAME  = "Master Card"
 
-# CSV column names for the raw export
 RAW_CSV_FIELDS = ["noteId", "cardType", "fields_json"]
-
-# CSV column names for the transformed output
-TRANSFORMED_CSV_FIELDS = [
-    "noteId", "cardType",
-    "japanese", "japanese_audio", "furigana", "reading",
-    "english", "english_audio",
-    "screenshots", "screenshot_text",
-    "explanations", "additional_notes",
-    "tags",
-    "previous_version",
-]
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AnkiConnect helper
-# ─────────────────────────────────────────────────────────────────────────────
+converter = cattrs.Converter()
 
-def invoke(action, **params):
+converter.register_structure_hook(
+    list,
+    lambda v, t: json.loads(v) if isinstance(v, str) else (v or []),
+)
+converter.register_unstructure_hook(
+    list,
+    lambda v: json.dumps(v, ensure_ascii=False),
+)
+
+
+def attr_name_to_anki_field(name: str) -> str:
+    return " ".join(word.capitalize() for word in name.split("_"))
+
+
+def anki_field_to_attr_name(field: str) -> str:
+    return "_".join(word.lower() for word in field.split())
+
+
+def master_card_to_anki_fields(mc: "MasterGenkiCard") -> dict[str, str]:
+    result = {}
+    for a in attrs.fields(MasterGenkiCard):
+        if a.name == "source_note":
+            continue
+        val = getattr(mc, a.name)
+        anki_name = attr_name_to_anki_field(a.name)
+        if isinstance(val, list):
+            result[anki_name] = " ".join(val)
+        else:
+            result[anki_name] = str(val) if val else ""
+    result["Previous Version"] = mc.source_note.pretty_string()
+    return result
+
+
+
+def invoke(action: str, **params) -> dict:
     return requests.post(
         "http://localhost:8765",
         json={"action": action, "version": 6, "params": params},
     ).json()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Field / Card / Deck
-# ─────────────────────────────────────────────────────────────────────────────
-
 @define
 class Field:
-    name: str
+    name:  str
     value: str
     _internal_mappings: dict[str, str] = attrs.field(factory=dict)
 
@@ -88,12 +102,12 @@ class Field:
         return f"{self.name}: {self.value}"
 
     def split_self(self) -> list[Self]:
-        value = self.value
+        value         = self.value
         sound_pattern = re.compile(r'\[sound:[^\]]+\]')
         img_pattern   = re.compile(r'<img[^>]+>')
-        sounds = sound_pattern.findall(value)
-        images = img_pattern.findall(value)
-        stripped = re.sub(r'(\[sound:[^\]]+\]|<img[^>]+>|<br\s*/?>|\s)', '', value)
+        sounds        = sound_pattern.findall(value)
+        images        = img_pattern.findall(value)
+        stripped      = re.sub(r'(\[sound:[^\]]+\]|<img[^>]+>|<br\s*/?>|\s)', '', value)
         if not stripped or (not sounds and not images):
             return [self]
         result    = []
@@ -120,40 +134,38 @@ class Field:
         image_count = 1
         audio_count = 1
 
-        def replace_image(match: re.Match[str]) -> str:
+        def replace_image(match: re.Match) -> str:
             nonlocal image_count
             placeholder = f"{{{{IMAGE:{image_count}}}}}"
             self._internal_mappings[placeholder] = match.group(0)
             image_count += 1
             return placeholder
 
-        def replace_audio(match: re.Match[str]) -> str:
+        def replace_audio(match: re.Match) -> str:
             nonlocal audio_count
             placeholder = f"{{{{AUDIO:{audio_count}}}}}"
             self._internal_mappings[placeholder] = match.group(0)
             audio_count += 1
             return placeholder
 
-        self.value = re.sub(r"<img[^>]+>", replace_image, self.value)
-        self.value = re.sub(r"\[sound:[^\]]+\]", replace_audio, self.value)
+        self.value = re.sub(r"<img[^>]+>",       replace_image, self.value)
+        self.value = re.sub(r"\[sound:[^\]]+\]",  replace_audio, self.value)
 
     def map_pretty_ids_to_ugly(self) -> None:
         for placeholder, original in self._internal_mappings.items():
             self.value = self.value.replace(placeholder, original)
 
-    def produce_base_64_images(self, media_path: Path) -> list[tuple[str, str]]:
-        unsubbed_value = self.value
-        for placeholder, original in self._internal_mappings.items():
-            unsubbed_value = unsubbed_value.replace(placeholder, original)
-        img_pattern = re.compile(r'<img\s+src="([^"]+)"[^>]*>')
-        results: list[tuple[str, str]] = []
-        for filename in img_pattern.findall(unsubbed_value):
-            path = media_path / filename
+    def produce_base64_images(self, media_path: Path) -> list[tuple[str, str]]:
+        unsubbed = self.value
+        for ph, orig in self._internal_mappings.items():
+            unsubbed = unsubbed.replace(ph, orig)
+        img_re  = re.compile(r'<img\s+src="([^"]+)"[^>]*>')
+        results = []
+        for filename in img_re.findall(unsubbed):
             try:
-                loaded = load_image_b64(path)
-                results.append(loaded)
+                results.append(load_image_b64(media_path / filename))
             except Exception as e:
-                logger.error("Problem loading media at '%s': %s", path, e)
+                logger.error("Problem loading media '%s': %s", filename, e)
         return results
 
 
@@ -162,50 +174,94 @@ def _field_names(fields: list[Field]) -> set[str]:
 
 
 def _assert_fields(card_type: str, fields: list[Field], expected: set[str]) -> None:
-    actual = _field_names(fields)
-    if expected != actual:
-        missing = expected - actual
-        extra   = actual   - expected
-        parts   = []
+    actual  = _field_names(fields)
+    missing = expected - actual
+    extra   = actual   - expected
+    if missing or extra:
+        parts = []
         if missing: parts.append(f"missing={missing}")
         if extra:   parts.append(f"extra={extra}")
         raise ValueError(f"[{card_type}] Field mismatch — {', '.join(parts)}")
 
 
-def _base_verify_split(card: "Card", expected_fields: set[str], starts_with_fields: set[str]) -> None:
+def _base_verify_split(card: "Card", expected_fields: set[str], starts_with: set[str]) -> None:
     names = _field_names(card.fields)
-    if not all(n in expected_fields or any(n.startswith(s) for s in starts_with_fields) for n in names):
-        raise ValueError(f"[{card.cardType} split] Unexpected field names: {names}")
+    for name in names:
+        if name not in expected_fields and not any(name.startswith(p) for p in starts_with):
+            raise ValueError(f"[{card.cardType} split] Unexpected field: {name!r}")
     for field in expected_fields:
         if field not in names:
-            raise ValueError(f"[{card.cardType} split] Missing {field=} from {names}")
+            raise ValueError(f"[{card.cardType} split] Missing field {field!r}")
 
 
-BASIC_FIELDS            = {"Front", "Back"}
-BASIC_FIELDS_PLUS_DASH  = [p + "-" for p in BASIC_FIELDS]
-PRACTICE_FIELDS = {
+BASIC_FIELDS             = {"Front", "Back"}
+PRACTICE_FIELDS          = {
     "Prompt", "Prompt Audio", "Prompt Picture", "Prompt Additional Instructions",
     "Prompt (English Tanslation)", "Answer", "Answer Audio",
     "Answer (English Translation)", "Additional Back Explanation", "Answer Picture",
 }
-PRACTICE_FIELDS_PLUS_DASH = [p + "-" for p in PRACTICE_FIELDS]
-VOCAB_FIELDS            = {"Japanese", "Japanese Audio", "Textbook Definition", "Picture (example)", "Additional Notes"}
-VOCAB_FIELDS_PLUS_DASH  = [f + "-" for f in VOCAB_FIELDS]
+VOCAB_FIELDS             = {"Japanese", "Japanese Audio", "Textbook Definition", "Picture (example)", "Additional Notes"}
 
-def verify_basic(card: "Card") -> None:                  _assert_fields(card.cardType, card.fields, BASIC_FIELDS)
-def verify_basic_split(card: "Card") -> None:            _base_verify_split(card, BASIC_FIELDS, BASIC_FIELDS_PLUS_DASH)
-def verify_genki_practice_card(card: "Card") -> None:    _assert_fields(card.cardType, card.fields, PRACTICE_FIELDS)
-def verify_genki_practice_card_split(card: "Card") -> None: _base_verify_split(card, PRACTICE_FIELDS, PRACTICE_FIELDS_PLUS_DASH)
-def verify_genki_vocab_card(card: "Card") -> None:       _assert_fields(card.cardType, card.fields, VOCAB_FIELDS)
-def verify_genki_vocab_card_split(card: "Card") -> None: _base_verify_split(card, VOCAB_FIELDS, VOCAB_FIELDS_PLUS_DASH)
+CORE_2000_FIELDS         = {
+    "Optimized-Voc-Index", "Vocabulary-Kanji", "Vocabulary-Furigana", "Vocabulary-Kana",
+    "Vocabulary-English", "Vocabulary-Audio", "Vocabulary-Pos", "Caution",
+    "Expression", "Reading", "Sentence-Kana", "Sentence-English", "Sentence-Clozed",
+    "Sentence-Audio", "Notes", "Core-Index", "Optimized-Sent-Index", "Frequency",
+    "English-Word-Audio", "English-Sentence-Audio", "Gemma4",
+}
 
-card_type_to_field_verification: dict[str, Callable[["Card"], None]] = {
-    "Basic":                     verify_basic,
-    "Basic (split)":             verify_basic_split,
-    "Genki Practice Card":       verify_genki_practice_card,
-    "Genki Practice Card Split": verify_genki_practice_card_split,
-    "Genki Vocab Card":          verify_genki_vocab_card,
-    "Genki Vocab Card Split":    verify_genki_vocab_card_split,
+VIDEO_FIELDS             = {
+    "Text", "Audio", "Image", "NaturalTranslation", "LiteralTranslation",
+    "TTSAudio", "Furigana", "WordGloss", "TimeCode", "FontName", "Source", "Notes",
+}
+
+JLAB_FIELDS              = {
+    "Version", "Sequence", "Source", "Audio", "Image",
+    "RemarksFront", "RemarksBack", "QuestionLink", "References",
+    "Other-Front", "Other-Back",
+    "Jlab-Kanji", "Jlab-KanjiSpaced", "Jlab-Hiragana", "Jlab-KanjiCloze",
+    "Jlab-Lemma", "Jlab-HiraganaCloze", "Jlab-Translation",
+    "Jlab-DictionaryLookup", "Jlab-Metadata", "Jlab-Remarks",
+    "Jlab-ListeningFront", "Jlab-ListeningBack",
+    "Jlab-ClozeFront", "Jlab-ClozeBack",
+}
+
+WILD_CARD_FIELDS         = {
+    "expression", "sentence", "furigana", "reading", "glossary",
+    "Note", "audio", "screenshot", "pitch-accent-graphs-jj", "url",
+}
+
+def _noop(_: "Card") -> None: pass
+
+def _verify_basic(card: "Card")          -> None: _assert_fields(card.cardType, card.fields, BASIC_FIELDS)
+def _verify_basic_split(card: "Card")    -> None: _base_verify_split(card, BASIC_FIELDS, {"Front-", "Back-"})
+def _verify_practice(card: "Card")       -> None: _assert_fields(card.cardType, card.fields, PRACTICE_FIELDS)
+def _verify_practice_split(card: "Card") -> None: _base_verify_split(card, PRACTICE_FIELDS, {p + "-" for p in PRACTICE_FIELDS})
+def _verify_vocab(card: "Card")          -> None: _assert_fields(card.cardType, card.fields, VOCAB_FIELDS)
+def _verify_vocab_split(card: "Card")    -> None: _base_verify_split(card, VOCAB_FIELDS, {f + "-" for f in VOCAB_FIELDS})
+def _verify_core2000(card: "Card")       -> None: _assert_fields(card.cardType, card.fields, CORE_2000_FIELDS)
+def _verify_video(card: "Card")          -> None: _assert_fields(card.cardType, card.fields, VIDEO_FIELDS)
+def _verify_jlab(card: "Card")           -> None: _assert_fields(card.cardType, card.fields, JLAB_FIELDS)
+def _verify_wild(card: "Card")           -> None: _assert_fields(card.cardType, card.fields, WILD_CARD_FIELDS)
+
+CARD_TYPE_VERIFIERS: dict[str, Callable[["Card"], None]] = {
+    "Basic":                        _verify_basic,
+    "Basic (split)":                _verify_basic_split,
+    "Genki Practice Card":          _verify_practice,
+    "Genki Practice Card Split":    _verify_practice_split,
+    "Genki Vocab Card":             _verify_vocab,
+    "Genki Vocab Card Split":       _verify_vocab_split,
+    "Core 2000":                    _verify_core2000,
+    "Japanese Video Sentence Cards+": _verify_video,
+    "JlabNote-JlabConverted-1":     _verify_jlab,
+    "Wild Cards":                   _verify_wild,
+    MASTER_MODEL_NAME:              _noop,
+}
+
+SPLIT_TYPE_MAP = {
+    "Basic":               "Basic (split)",
+    "Genki Practice Card": "Genki Practice Card Split",
+    "Genki Vocab Card":    "Genki Vocab Card Split",
 }
 
 
@@ -216,7 +272,7 @@ class Card:
     fields:   list[Field]
 
     def __attrs_post_init__(self):
-        verifier = card_type_to_field_verification.get(self.cardType)
+        verifier = CARD_TYPE_VERIFIERS.get(self.cardType)
         if verifier is None:
             raise ValueError(f"No verifier registered for card type '{self.cardType}'")
         verifier(self)
@@ -224,25 +280,22 @@ class Card:
     @classmethod
     def from_notes_info(cls, data: Any) -> list[Self]:
         output = []
-        if not isinstance(data, list):
-            return output
-        for note in data:
+        for note in (data if isinstance(data, list) else []):
             if not isinstance(note, dict):
                 continue
-            noteId = note.get('noteId')
+            noteId = note.get("noteId")
             if noteId is None:
                 continue
-            cardType        = note.get('modelName', '')
-            fields_unloaded = note.get('fields')
-            if not fields_unloaded or not isinstance(fields_unloaded, dict):
-                output.append(cls(noteId, cardType, []))
-                continue
-            fields = [Field(k, str(v.get('value', ''))) for k, v in cast(dict[str, dict], fields_unloaded).items()]
-            output.append(cls(noteId, cardType, fields))
+            cardType  = note.get("modelName", "")
+            raw_fields = note.get("fields") or {}
+            fields = [Field(k, str(v.get("value", ""))) for k, v in cast(dict[str, dict], raw_fields).items()]
+            try:
+                output.append(cls(noteId, cardType, fields))
+            except ValueError as e:
+                logger.warning("Skipping note %s: %s", noteId, e)
         return output
 
     def to_csv_row(self) -> dict:
-        """Serialise to a row for raw_cards.csv."""
         return {
             "noteId":      self.noteId,
             "cardType":    self.cardType,
@@ -251,49 +304,44 @@ class Card:
 
     @classmethod
     def from_csv_row(cls, row: dict) -> Self:
-        """Deserialise from a raw_cards.csv row."""
         fields_dict = json.loads(row["fields_json"])
-        fields = [Field(k, v) for k, v in fields_dict.items()]
-        return cls(noteId=row["noteId"], cardType=row["cardType"], fields=fields)
+        return cls(
+            noteId   = row["noteId"],
+            cardType = row["cardType"],
+            fields   = [Field(k, v) for k, v in fields_dict.items()],
+        )
 
     def pretty_string(self) -> str:
-        joined = '\n\t'.join(f.pretty_string() for f in self.fields)
+        joined = "\n\t".join(f.pretty_string() for f in self.fields)
         return f"Card {self.noteId}\n- Fields:\n\t{joined}"
 
     def get_field(self, name: str) -> str:
         for f in self.fields:
             if f.name == name:
                 return f.value
-        return ""
+        raise ValueError(f"{self.cardType} has no field '{name}'")
 
     def get_fields_like(self, prefix: str) -> list[Field]:
         return [f for f in self.fields if f.name.startswith(prefix)]
 
     def split_fields(self) -> "Card":
-        split_type_map = {
-            "Basic":               "Basic (split)",
-            "Genki Practice Card": "Genki Practice Card Split",
-            "Genki Vocab Card":    "Genki Vocab Card Split",
-        }
-        new_type = split_type_map.get(self.cardType, self.cardType)
-        new_fields: list[Field] = []
+        new_type   = SPLIT_TYPE_MAP.get(self.cardType, self.cardType)
+        new_fields = []
         for f in self.fields:
             new_fields.extend(f.split_self())
         return Card(noteId=self.noteId, cardType=new_type, fields=new_fields)
 
     def map_ugly_ids_to_pretty(self) -> None:
-        for f in self.fields:
-            f.map_ugly_ids_to_pretty()
+        for f in self.fields: f.map_ugly_ids_to_pretty()
 
     def map_pretty_ids_to_ugly(self) -> None:
-        for f in self.fields:
-            f.map_pretty_ids_to_ugly()
+        for f in self.fields: f.map_pretty_ids_to_ugly()
 
-    def get_all_images(self, media_path: Path) -> list[tuple[str, str]]:
-        output = []
-        for field in self.fields:
-            output.extend(field.produce_base_64_images(media_path))
-        return output
+    def produce_base64_images(self, media_path: Path) -> list[tuple[str, str]]:
+        out = []
+        for f in self.fields:
+            out.extend(f.produce_base64_images(media_path))
+        return out
 
 
 @define
@@ -310,108 +358,110 @@ class Deck:
         return cls(name, Card.from_notes_info(info))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Master card
-# ─────────────────────────────────────────────────────────────────────────────
-
 def strip_ruby(text: str) -> str:
-    """Remove HTML ruby tags, keeping only the base text (not the <rt> readings)."""
-    # Remove <rt>...</rt> content entirely
     text = re.sub(r'<rt>[^<]*</rt>', '', text)
-    # Remove remaining ruby tags
     text = re.sub(r'</?ruby>', '', text)
     return text
 
+
+def bracket_furigana_to_ruby(text: str) -> str:
+    return re.sub(r'([^\s\[]+)\[([^\]]+)\]', r'<ruby>\1<rt>\2</rt></ruby>', text)
+
+
+def strip_brackets(text: str) -> str:
+    return strip_ruby((bracket_furigana_to_ruby(text)))
+
+
+def ruby_to_reading(text: str) -> str:
+    text = re.sub(r'<ruby>.*?<rt>(.*?)</rt></ruby>', r'\1', text)
+    return text
+
+
+def bracket_to_reading(text: str) -> str:
+    return re.sub(r'([^\s\[]+)\[([^\]]+)\]', r'\2', text)
+
+
+def furigana_to_reading(text: str) -> str:
+    return ruby_to_reading(bracket_furigana_to_ruby(text))
+
+
+def build_tags(
+    *,
+    source_deck:  str,
+    card_subtype: str | None = None,
+    extra: list[str] | None  = None,
+) -> list[str]:
+    slug = re.sub(r'\s+', '_', source_deck.strip().lower())
+    tags = [f"source::{slug}"]
+    if card_subtype:
+        tags.append(f"type::{card_subtype.lower()}")
+    tags.extend(extra or [])
+    return tags
+
+
+_MASTER_CARD_CSV_FIELDS = [
+    "noteId", "cardType",
+    "japanese", "japanese_audio", "furigana", "reading",
+    "english", "english_audio",
+    "screenshots", "screenshot_text",
+    "explanations", "additional_notes",
+    "tags",
+    "llm_translator", "japanese_audio_model", "english_audio_model",
+    "source",
+    "previous_version",
+]
+
+_ANKI_FIELD_NAMES = [
+    "Japanese", "Japanese Audio", "Furigana", "Reading",
+    "English", "English Audio",
+    "Screenshots", "Screenshot Text",
+    "Explanations", "Additional Notes",
+    "Tags",
+    "Previous Version",
+]
+
+
 @define
 class MasterGenkiCard:
-    source_note:      Card
-    japanese:         str       = ""
-    japanese_audio:   list[str] = None
-    furigana:         str       = ""
-    reading:          str       = ""
-    english:          str       = ""
-    english_audio:    str       = ""
-    screenshots:      list[str] = None
-    explanations:     str       = ""
-    additional_notes: str       = ""
-    screenshot_text:  str       = ""
-    tags:             list[str] = None
-    llm_translator:   str       = ""
-    japanese_audio_model: str   = ""
-    english_audio_model: str    = ""
-    source: str                 = ""
+    source_note:          Card
+    japanese:             str       = ""
+    japanese_audio:       list[str] = attrs.Factory(list)
+    furigana:             str       = ""
+    reading:              str       = ""
+    english:              str       = ""
+    english_audio:        str       = ""
+    screenshots:          list[str] = attrs.Factory(list)
+    explanations:         str       = ""
+    additional_notes:     str       = ""
+    screenshot_text:      str       = ""
+    tags:                 list[str] = attrs.Factory(list)
+    llm_translator:       str       = ""
+    japanese_audio_model: str       = ""
+    english_audio_model:  str       = ""
+    source:               str       = ""
 
     def __attrs_post_init__(self):
-        if self.screenshots    is None: self.screenshots    = []
-        if self.tags           is None: self.tags           = []
-        if self.japanese_audio is None: self.japanese_audio = []
         self.japanese = strip_ruby(self.japanese)
 
+
     def to_anki_fields(self) -> dict[str, str]:
-        return {
-            "Japanese":         self.japanese,
-            "Japanese Audio":   " ".join(self.japanese_audio),
-            "Furigana":         self.furigana,
-            "Reading":          self.reading,
-            "English":          self.english,
-            "English Audio":    self.english_audio,
-            "Screenshots":      " ".join(self.screenshots),
-            "Screenshot Text":  self.screenshot_text,
-            "Explanations":     self.explanations,
-            "Additional Notes": self.additional_notes,
-            "Previous Version": self.source_note.pretty_string(),
-            "Tags":             " ".join(self.tags),
-        }
+        return master_card_to_anki_fields(self)
 
     def to_csv_row(self) -> dict:
-        """Serialise to a row for transformed_cards.csv."""
-        return {
-            "noteId":          self.source_note.noteId,
-            "cardType":        self.source_note.cardType,
-            "japanese":        self.japanese,
-            "japanese_audio":  json.dumps(self.japanese_audio,  ensure_ascii=False),
-            "furigana":        self.furigana,
-            "reading":         self.reading,
-            "english":         self.english,
-            "english_audio":   self.english_audio,
-            "screenshots":     json.dumps(self.screenshots,     ensure_ascii=False),
-            "screenshot_text": self.screenshot_text,
-            "explanations":    self.explanations,
-            "additional_notes":self.additional_notes,
-            "tags":            json.dumps(self.tags,            ensure_ascii=False),
-            "previous_version":self.source_note.pretty_string(),
-            "llm_translator": self.llm_translator,
-            "japanese_audio_model": self.japanese_audio_model,
-            "english_audio_model": self.english_audio_model,
-            "source": self.source,
-        }
+        d = converter.unstructure(self)
+        d.pop("source_note", None)
+        d["noteId"]           = self.source_note.noteId
+        d["cardType"]         = self.source_note.cardType
+        d["previous_version"] = self.source_note.pretty_string()
+        return {k: d.get(k, "") for k in _MASTER_CARD_CSV_FIELDS}
 
     @classmethod
     def from_csv_row(cls, row: dict, source_card: Card) -> Self:
-        """Deserialise from a transformed_cards.csv row."""
-        return cls(
-            source_note      = source_card,
-            japanese         = row.get("japanese",         ""),
-            japanese_audio   = json.loads(row.get("japanese_audio",  "[]")),
-            furigana         = row.get("furigana",         ""),
-            reading          = row.get("reading",          ""),
-            english          = row.get("english",          ""),
-            english_audio    = row.get("english_audio",    ""),
-            screenshots      = json.loads(row.get("screenshots",     "[]")),
-            screenshot_text  = row.get("screenshot_text",  ""),
-            explanations     = row.get("explanations",     ""),
-            additional_notes = row.get("additional_notes", ""),
-            tags             = json.loads(row.get("tags",             "[]")),
-            llm_translator = row.get("llm_translator", ""),
-            japanese_audio_model = row.get("japanese_audio_model", ""),
-            english_audio_model = row.get("english_audio_model", ""),
-            source = row.get("source", ""),
-        )
+        field_names = {a.name for a in attrs.fields(cls) if a.name != "source_note"}
+        data = {k: v for k, v in row.items() if k in field_names}
+        data["source_note"] = source_card
+        return converter.structure(data, cls)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CSV I/O
-# ─────────────────────────────────────────────────────────────────────────────
 
 def write_raw_csv(cards: list[Card], path: Path) -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -419,7 +469,7 @@ def write_raw_csv(cards: list[Card], path: Path) -> None:
         writer.writeheader()
         for card in cards:
             writer.writerow(card.to_csv_row())
-    print(f"Wrote {len(cards)} raw cards → {path}")
+    logger.info(f"Wrote {len(cards)} raw cards → {path}")
 
 
 def read_raw_csv(path: Path) -> list[Card]:
@@ -430,15 +480,15 @@ def read_raw_csv(path: Path) -> list[Card]:
                 cards.append(Card.from_csv_row(row))
             except Exception as e:
                 logger.warning("Skipping malformed row (noteId=%s): %s", row.get("noteId"), e)
-    print(f"Read {len(cards)} raw cards ← {path}")
+    logger.info(f"Read {len(cards)} raw cards ← {path}")
     return cards
 
 
-def write_transformed_csv(master_cards: list[MasterGenkiCard], path: Path, append: bool = False) -> None:
+def write_transformed_csv(master_cards: list["MasterGenkiCard"], path: Path, append: bool = False) -> None:
     write_header = not append or not path.exists() or path.stat().st_size == 0
     mode = "a" if append else "w"
     with open(path, mode, newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=TRANSFORMED_CSV_FIELDS)
+        writer = csv.DictWriter(fh, fieldnames=_MASTER_CARD_CSV_FIELDS)
         if write_header:
             writer.writeheader()
         for mc in master_cards:
@@ -447,41 +497,30 @@ def write_transformed_csv(master_cards: list[MasterGenkiCard], path: Path, appen
     logger.info("%s %d transformed cards → %s", action, len(master_cards), path)
 
 
-def read_transformed_csv(path: Path) -> list[MasterGenkiCard]:
-    """
-    Reconstruct MasterGenkiCards from CSV.
-    The source_card is a minimal stub — enough to populate previous_version
-    and carry the noteId/cardType through to AnkiConnect.
-    """
+def read_transformed_csv(path: Path) -> list["MasterGenkiCard"]:
     master_cards = []
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv.DictReader(fh):
             note_id   = row.get("noteId", "")
             card_type = row.get("cardType", "")
-            # Stub card — fields not needed for import, only noteId + cardType
-            stub_fields = [Field("_stub", row.get("previous_version", ""))]
+            stub_card = object.__new__(Card)
+            object.__setattr__(stub_card, "noteId",   note_id)
+            object.__setattr__(stub_card, "cardType", card_type)
+            object.__setattr__(stub_card, "fields",   [Field("_stub", row.get("previous_version", ""))])
             try:
-                # Bypass verification for the stub by building directly
-                stub_card = object.__new__(Card)
-                object.__setattr__(stub_card, "noteId",   note_id)
-                object.__setattr__(stub_card, "cardType", card_type)
-                object.__setattr__(stub_card, "fields",   stub_fields)
                 master_cards.append(MasterGenkiCard.from_csv_row(row, stub_card))
             except Exception as e:
                 logger.warning("Skipping malformed row (noteId=%s): %s", note_id, e)
-    print(f"Read {len(master_cards)} transformed cards ← {path}")
+    logger.info(f"Read {len(master_cards)} transformed cards ← {path}")
     return master_cards
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM prompts
-# ─────────────────────────────────────────────────────────────────────────────
 
-BASE_SYSTEM_PROMPT = """\
+BASE_SYSTEM_PROMPT = f"""\
 You are an expert Japanese language tutor and Anki card formatter.
 
-Your job is to convert a legacy Anki flashcard into a standardised "Master Genki Card".
-The Master Genki Card has the following fields:
+Your job is to convert a legacy Anki flashcard into a standardised "{MASTER_MODEL_NAME}".
+The {MASTER_MODEL_NAME} has the following fields:
 
   japanese          - The Japanese text: a word, phrase, or full sentence.
   furigana          - The japanese text with furigana inserted above every kanji using
@@ -523,7 +562,7 @@ The Master Genki Card has the following fields:
                       Japanese and English text visible in it, verbatim, so it is
                       searchable. Use "---" to separate multiple screenshots.
                       Leave blank if no image was supplied or the image contains
-                      no helpful text (such as a pure example picture).
+                      no helpful text.
 
 Rules you must always follow:
 1. Output ONLY a single JSON object with exactly these keys:
@@ -536,10 +575,88 @@ Rules you must always follow:
 7. All audio fields are Japanese audio. You may safely ignore them.
 """
 
+def _base_sentence_prompt(card_name: str, front_content: str, additional_rules: list[str] | None = None) -> str:
+    rules = [
+        "No markdown fences. No extra explanations.",
+        "The card will likely contain everything you need to do this \
+        or may already be a one-line English summary. In this case, \
+        pull only from the card - do not add anything. If the card \
+        does NOT contain enough information to produce a one-line \
+        summary, you may produce your own one-line summary. Make \
+        it concise and literal.",
+        "The \"one-line\" summary should always be the answer to the front.",
+    ]
+    rules.extend(additional_rules)
+    str_rules = ""
+    for i, rule in enumerate(rules):
+        str_rules = f"\n{i+1}. {rule}"
+    return f"""\
+You are an expert Japanese language tutor and Anki card formatter.
+
+Your job is to convert a {card_name} flashcard into a standardised "{MASTER_MODEL_NAME}".
+
+The card shows {front_content} on the front. Your primary task is to
+produce a concise one-line English summary for the `english` field (the answer field).
+All other fields are mapped directly from the source — do NOT invent or
+reinterpret them.
+
+Output ONLY a concise one-line English summary for the `english` field.
+
+Rules:
+{str_rules}
+"""
+
+JLAB_SYSTEM_PROMPT = _base_sentence_prompt(
+    "Japanese Like a Breeze (JLab)",
+    "a Japanese sentence",
+    [
+        "Jlab often has words in '[]'.\
+        This means that the words are implied \
+        but not explicitly said. Do NOT add these \
+        words into your summary. If jlab considers \
+        them implied by adding '[]', ignore them."
+    ],
+)
+WILD_SYSTEM_PROMPT = _base_sentence_prompt("Yomitan", "a Japanese vocab word/expression and a context sentence")
+
+
 EXPECTED_OUTPUT_FIELDS = [
     "japanese", "furigana", "reading", "english",
     "explanations", "additional_notes", "screenshot_text",
 ]
+
+
+def _parse_llm_json(raw: str) -> dict:
+    clean   = re.sub(r'^```[a-zA-Z]*\n?', '', raw.strip())
+    clean   = re.sub(r'\n?```$', '', clean)
+    output  = json.loads(clean)
+    if not isinstance(output, dict):
+        raise ValueError(f"Expected dict, got: {type(output)}")
+    missing = [f for f in EXPECTED_OUTPUT_FIELDS if f not in output]
+    extra   = [f for f in output if f not in EXPECTED_OUTPUT_FIELDS]
+    if missing or extra:
+        raise ValueError(f"Field mismatch — missing={missing}, extra={extra}")
+    return output
+
+
+def _parse_llm_sentence(raw: str) -> str:
+    clean   = re.sub(r'^```[a-zA-Z]*\n?', '', raw.strip())
+    clean   = re.sub(r'\n?```$', '', clean)
+    return clean
+
+
+def _collect_audio(card: Card) -> list[str]:
+    audios = []
+    for f in card.fields:
+        audios += re.findall(r'\[sound:[^\]]+\]', f.value)
+    return audios
+
+
+def _collect_images(card: Card) -> list[str]:
+    imgs = []
+    for f in card.fields:
+        imgs += re.findall(r'<img[^>]+>', f.value)
+    return imgs
 
 
 def build_basic_prompt(card: Card) -> str:
@@ -622,82 +739,378 @@ Mapping guidance:
 """
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Transform pipeline helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def build_jlab_prompt(card: Card) -> str:
+    kanji    = card.get_field("Jlab-Kanji")
+    remarks  = card.get_field("RemarksBack")
+    return f"""\
+SOURCE CARD TYPE: JLab (Japanese Like a Breeze)
 
-def _parse_llm_json(raw: str) -> dict:
-    clean  = re.sub(r'^```[a-zA-Z]*\n?', '', raw.strip())
-    clean  = re.sub(r'\n?```$', '', clean)
-    output = json.loads(clean)
-    if not isinstance(output, dict):
-        raise ValueError(f"Expected output to be a dict. Got: {output}")
-    missing = [f for f in EXPECTED_OUTPUT_FIELDS if f not in output]
-    extra   = [f for f in output if f not in EXPECTED_OUTPUT_FIELDS]
-    if missing or extra:
-        raise ValueError(
-            f"Expected fields: {EXPECTED_OUTPUT_FIELDS}. "
-            f"Missing: {missing}. Extra: {extra}."
-        )
-    return output
+Japanese sentence: {kanji}
+RemarksBack (existing back translation/explanation): {remarks or "(none)"}
+
+Produce a one-line English translation/answer for the front of the card.
+It should draw on RemarksBack if present or any other information within the card.
+
+--- FULL CARD ---
+{card.pretty_string()}
+"""
 
 
-def _collect_audio(card: Card) -> list[str]:
-    audios = []
-    for f in card.fields:
-        audios += re.findall(r'\[sound:[^\]]+\]', f.value)
-    return audios
+def build_wild_prompt(card: Card) -> str:
+    expression    = card.get_field("expression")
+    sentence = card.get_field("sentence")
+    glossary = card.get_field("glossary")
+    return f"""\
+SOURCE CARD TYPE: Yomitan
+
+Japanese vocab/expression: {expression}
+Context sentence: {sentence}
+Yomitan dictionary: {glossary}
+
+Produce a one-line English translation/answer for the front of the card.
+It should from the Yomitan dictionary and answer the Japanese vocab/expression.
+
+--- FULL CARD ---
+{card.pretty_string()}
+"""
 
 
-def _collect_images(card: Card) -> list[str]:
-    imgs = []
-    for f in card.fields:
-        imgs += re.findall(r'<img[^>]+>', f.value)
-    return imgs
+def transform_core2000(card: Card) -> tuple["MasterGenkiCard", "MasterGenkiCard"]:
+    # vocab part
+    vocab_kanji          = card.get_field("Vocabulary-Kanji")
+    vocab_furigana   = card.get_field("Vocabulary-Furigana")
+    vocab_kana           = card.get_field("Vocabulary-Kana")
+    vocab_english        = card.get_field("Vocabulary-English")
+    vocab_audio    = card.get_field("Vocabulary-Audio")
+    vocab_pos            = card.get_field("Vocabulary-Pos")
+    vocab_freq           = card.get_field("Frequency")
+    vocab_eng_audio = card.get_field("English-Word-Audio")
+
+    # sentence part
+    sent_eng_audio = card.get_field("English-Sentence-Audio")
+    sent_eng_gemma4         = card.get_field("Gemma4")
+    sent_eng_original   = card.get_field("Sentence-English")
+    sent_expression     = card.get_field("Expression")
+    sent_furigana     = card.get_field("Reading")
+    sent_kana      = card.get_field("Sentence-Kana")
+    sent_audio     = card.get_field("Sentence-Audio")
+
+    # shared
+    caution        = card.get_field("Caution")
+    notes_field    = card.get_field("Notes")
+
+
+    vocab_furigana = bracket_furigana_to_ruby(vocab_furigana) if vocab_furigana else vocab_kanji
+    sent_furigana = bracket_furigana_to_ruby(sent_furigana) if sent_furigana else sent_expression
+
+    vocab_explanations = []
+    if vocab_pos:     vocab_explanations.append(f"Part of speech: {vocab_pos}")
+    if caution: vocab_explanations.append(f"Caution: {caution}")
+    if vocab_freq:    vocab_explanations.append(f"Frequency rank: {vocab_freq}")
+    if notes_field: vocab_explanations.append(notes_field)
+
+    sentence_additional_notes = []
+    if caution: sentence_additional_notes.append(f"Caution: {caution}")
+    if notes_field: sentence_additional_notes.append(notes_field)
+    if sent_eng_original: sentence_additional_notes.append(f"Original translation: {sent_eng_original}")
+
+    base_tags = build_tags(
+        source_deck  = "Core 2000",
+        extra        = ["llm::gemma4_31b"],
+    )
+
+    vocab_card = MasterGenkiCard(
+        source_note          = card,
+        japanese             = strip_brackets(vocab_kanji),
+        japanese_audio       = [vocab_audio] if vocab_audio else [],
+        furigana             = vocab_furigana,
+        reading              = vocab_kana,
+        english              = vocab_english,
+        english_audio        = vocab_eng_audio,
+        screenshots          = [],
+        explanations         = "\n".join(vocab_explanations),
+        additional_notes     = "",
+        screenshot_text      = "",
+        tags                 = base_tags + ["type::vocab"],
+        llm_translator       = "gemma4-31b",
+        japanese_audio_model = "core2000_bundled",
+        english_audio_model  = "kokoro_af_heart",
+        source               = "Core 2000",
+    )
+
+    sent_card = MasterGenkiCard(
+        source_note          = card,
+        japanese             = strip_brackets(sent_expression),
+        japanese_audio       = [sent_audio] if sent_audio else [],
+        furigana             = sent_furigana,
+        reading              = sent_kana,
+        english              = sent_eng_gemma4,
+        english_audio        = sent_eng_audio,
+        screenshots          = [],
+        explanations         = f"Vocabulary in context: {vocab_kanji} ({vocab_english})",
+        additional_notes     = sentence_additional_notes,
+        screenshot_text      = "",
+        tags                 = base_tags + ["type::sentence"],
+        llm_translator       = "gemma4-31b",
+        japanese_audio_model = "core2000_bundled",
+        english_audio_model  = "kokoro_af_heart",
+        source               = "Core 2000",
+    )
+
+    return (vocab_card, sent_card)
+
+
+def transform_video(card: Card) -> "MasterGenkiCard":
+    japanese          = card.get_field("Text")
+    japanese_audio    = card.get_field("Audio")
+    image             = card.get_field("Image")
+    natural_english   = card.get_field("NaturalTranslation")
+    literal_english   = card.get_field("LiteralTranslation")
+    english_audio     = card.get_field("TTSAudio")
+    furigana_raw      = card.get_field("Furigana")
+    word_gloss        = card.get_field("WordGloss")
+    source_time       = card.get_field("TimeCode")
+    source_file       = card.get_field("Source")
+    notes             = card.get_field("Notes")
+
+    source = f"Japanese Video Deck: {source_file} {source_time}"
+
+    additional = []
+    if literal_english:     additional.append(f"Literal: {literal_english}")
+    if source_file: additional.append(f"Source: {source_file}")
+    if notes:       additional.append(notes)
+
+    return MasterGenkiCard(
+        source_note          = card,
+        japanese             = japanese,
+        japanese_audio       = [japanese_audio] if japanese_audio else [],
+        furigana             = furigana_raw or japanese,
+        reading              = furigana_to_reading(furigana_raw),
+        english              = natural_english,
+        english_audio        = english_audio,
+        screenshots          = [image] if image else [],
+        explanations         = word_gloss,
+        additional_notes     = "\n".join(additional),
+        screenshot_text      = "",
+        tags                 = build_tags(
+            source_deck  = "Japanese Video Deck",
+            card_subtype = "sentence",
+            extra        = ["source_media::cij"],
+        ),
+        llm_translator       = "gemma4-31b",
+        japanese_audio_model = "video_bundled",
+        english_audio_model  = "kokoro_af_heart",
+        source               = source,
+    )
+
+
+def transform_wild(card: Card, english: str) -> "MasterGenkiCard":
+    """
+    Wild Cards (Yomitan) → MasterGenkiCard.
+    Sentence preserved in additional_notes; no LLM needed.
+    """
+    expression   = card.get_field("expression")
+    sentence     = card.get_field("sentence")
+    furigana_raw = card.get_field("furigana")
+    reading      = card.get_field("reading")
+    glossary     = card.get_field("glossary")
+    audio        = card.get_field("audio")
+    screenshot   = card.get_field("screenshot")
+    pitch_accent = card.get_field("pitch-accent-graphs-jj")
+    url          = card.get_field("url")
+
+    furigana_html = bracket_furigana_to_ruby(furigana_raw)
+
+    additional_parts = []
+    if pitch_accent:     additional_parts.append(f"{pitch_accent}")
+    if sentence: additional_parts.append(f"Example sentence: {sentence}")
+
+    return MasterGenkiCard(
+        source_note          = card,
+        japanese             = expression,
+        japanese_audio       = [audio] if audio else [],
+        furigana             = furigana_html or expression,
+        reading              = reading,
+        english              = english,
+        english_audio        = "",
+        screenshots          = [screenshot] if screenshot else [],
+        explanations         = glossary,
+        additional_notes     = "\n".join(additional_parts),
+        screenshot_text      = "",
+        tags                 = build_tags(
+            source_deck  = "In the Wild",
+            card_subtype = "vocab",
+            extra        = ["source::yomitan"],
+        ),
+        llm_translator       = LLM_MODEL,
+        japanese_audio_model = "yomitan_bundled",
+        english_audio_model  = "",
+        source               = url or "Yomitan",
+    )
+
+
+def transform_jlab(card: Card, english: str) -> "MasterGenkiCard":
+    source = card.get_field("Source")
+    japanese_audio = card.get_field("Audio")
+    image = card.get_field("Image")
+    remarks_front = card.get_field("RemarksFront")
+    explanation = card.get_field("RemarksBack")
+    question_link = card.get_field("QuestionLink")
+    references = card.get_field("References")
+    furigana = card.get_field("Other-Front")
+    other_back = card.get_field("Other-Back")
+    japanese = card.get_field("Jlab-Kanji")
+    spaced_japanese = card.get_field("Jlab-KanjiSpaced")
+    reading = card.get_field("Jlab-Hiragana")
+    romaji = card.get_field("Jlab-ListeningFront")
+
+    furigana = bracket_furigana_to_ruby(furigana)
+
+    additional_parts = []
+    if romaji: additional_parts.append(f"Romaji: {romaji}")
+    if spaced_japanese: additional_parts.append(f"Spaced: {spaced_japanese}")
+    if remarks_front: additional_parts.append(f"Remarks front: {remarks_front}")
+    if question_link: additional_parts.append(f"Question link: {question_link}")
+    if references: additional_parts.append(f"References: {references}")
+    if other_back: additional_parts.append(f"Other back: {other_back}")
+
+
+    return MasterGenkiCard(
+        source_note          = card,
+        japanese             = japanese,
+        japanese_audio       = [japanese_audio] if japanese_audio else [],
+        furigana             = furigana,
+        reading              = reading,
+        english              = english,
+        english_audio        = "",
+        screenshots          = [image] if image else [],
+        explanations         = explanation,
+        additional_notes     = "\n".join(additional_parts),
+        screenshot_text      = "",
+        tags                 = build_tags(
+            source_deck  = "Jlab's beginner course",
+            card_subtype = "sentence",
+            extra        = ["source::jlab"],
+        ),
+        llm_translator       = LLM_MODEL,
+        japanese_audio_model = "jlab_bundled",
+        english_audio_model  = "",
+        source               = source or "Jlab",
+    )
 
 
 def build_prompt_request_for_card(card: Card, media_path: Path) -> PromptRequest:
+    ct = card.cardType
+    if ct not in LLM_CARD_TYPES:
+        raise ValueError(f"{ct} not in {LLM_CARD_TYPES}")
+
     split_card = card.split_fields()
     split_card.map_ugly_ids_to_pretty()
-    ct = split_card.cardType
-    if ct in ("Basic", "Basic (split)"):
+    sct = split_card.cardType
+
+    if ct in ("JlabNote-JlabConverted-1",):
+        return PromptRequest(
+            system_prompt  = JLAB_SYSTEM_PROMPT,
+            user_prompt    = build_jlab_prompt(split_card),
+            base_64_images = None,  # not helpful for jlab
+            validator      = _parse_llm_sentence,
+        )
+    
+    if ct in ("Wild Cards",):
+        return PromptRequest(
+            system_prompt  = WILD_SYSTEM_PROMPT,
+            user_prompt    = build_wild_prompt(split_card),
+            base_64_images = None,  # not helpful for wild cards
+            validator      = _parse_llm_sentence,
+        )
+
+    if sct in ("Basic", "Basic (split)"):
         user_prompt = build_basic_prompt(split_card)
-    elif ct in ("Genki Practice Card", "Genki Practice Card Split"):
+    elif sct in ("Genki Practice Card", "Genki Practice Card Split"):
         user_prompt = build_practice_prompt(split_card)
-    elif ct in ("Genki Vocab Card", "Genki Vocab Card Split"):
+    elif sct in ("Genki Vocab Card", "Genki Vocab Card Split"):
         user_prompt = build_vocab_prompt(split_card)
     else:
-        raise ValueError(f"Unknown card type: {ct}")
+        raise ValueError(f"No prompt builder for card type: {ct!r}")
 
     return PromptRequest(
         system_prompt  = BASE_SYSTEM_PROMPT,
         user_prompt    = user_prompt,
-        base_64_images = card.get_all_images(media_path),
+        base_64_images = card.produce_base64_images(media_path),
         validator      = _parse_llm_json,
     )
 
 
-def assemble_master_card(card: Card, llm_raw: str) -> MasterGenkiCard:
+def _llm_card_tags(card: Card) -> list[str]:
+    """Map source card type to tags for LLM-processed cards."""
+    ct = card.cardType
+
+    if "Genki Practice Card" in ct:
+        return build_tags(source_deck="Genki I", card_subtype="sentence")
+    if "Genki Vocab Card" in ct:
+        return build_tags(source_deck="Genki I", card_subtype="vocab-sentence")
+    if "Basic" in ct:
+        return build_tags(source_deck="Genki I", card_subtype="vocab-sentence")
+    
+    if "Jlab" in ct:
+        return build_tags(source_deck="Jlab's beginner course", card_subtype="sentence")
+    
+    if "Core 2000" in ct:
+        return build_tags(source_deck="Core 2000", card_subtype="vocab-sentence")
+    
+    if "Wild" in ct:
+        return build_tags(source_deck="In the Wild", card_subtype="vocab")
+    
+    if "Japanese Video Sentence Cards" in ct:
+        return build_tags(source_deck="Japanese Video Deck", card_subtype="sentence")
+
+    return build_tags(source_deck="unknown")
+
+NO_LLM_CARD_TYPES = {"Core 2000", "Japanese Video Sentence Cards+"}
+LLM_CARD_TYPES    = {"Basic", "Basic (split)", "Genki Practice Card", "Genki Vocab Card",
+                     "JlabNote-JlabConverted-1", "Wild Cards"}
+
+
+def assemble_master_card_from_llm(card: Card, llm_raw: str) -> "MasterGenkiCard":
     card.map_pretty_ids_to_ugly()
-    data = _parse_llm_json(llm_raw)
+    if "Jlab" in card.cardType:
+        return transform_jlab(card, _parse_llm_sentence(llm_raw))
+    
+    if "Wild" in card.cardType:
+        return transform_wild(card,  _parse_llm_sentence(llm_raw))
+    
+    data  = _parse_llm_json(llm_raw)
+
     return MasterGenkiCard(
-        source_note      = card,
-        japanese         = data.get("japanese",         ""),
-        furigana         = data.get("furigana",         ""),
-        reading          = data.get("reading",          ""),
-        english          = data.get("english",          ""),
-        english_audio    = "",
-        japanese_audio   = _collect_audio(card),
-        screenshots      = _collect_images(card),
-        screenshot_text  = data.get("screenshot_text", ""),
-        explanations     = data.get("explanations",    ""),
-        additional_notes = data.get("additional_notes",""),
+        source_note          = card,
+        japanese             = data.get("japanese",         ""),
+        furigana             = data.get("furigana",         ""),
+        reading              = data.get("reading",          ""),
+        english              = data.get("english",          ""),
+        english_audio        = "",
+        japanese_audio       = _collect_audio(card),
+        screenshots          = _collect_images(card),
+        screenshot_text      = data.get("screenshot_text", ""),
+        explanations         = data.get("explanations",    ""),
+        additional_notes     = data.get("additional_notes",""),
+        tags                 = _llm_card_tags(card),
+        llm_translator       = LLM_MODEL,
+        japanese_audio_model = "",
+        english_audio_model  = "",
+        source               = "",
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AnkiConnect write helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def transform_no_llm(card: Card) -> Iterable["MasterGenkiCard"]:
+    ct = card.cardType
+    if ct not in NO_LLM_CARD_TYPES:
+        raise ValueError(f"{ct} not in {NO_LLM_CARD_TYPES}")
+    if ct == "Core 2000":
+        return transform_core2000(card)
+    if ct == "Japanese Video Sentence Cards+":
+        return [transform_video(card)]
+    raise ValueError(f"Unhandled no-LLM card type: {ct!r}")
+
 
 def _ensure_model_fields(field_names: list[str]) -> None:
     result  = invoke("modelFieldNames", modelName=MASTER_MODEL_NAME)
@@ -706,31 +1119,29 @@ def _ensure_model_fields(field_names: list[str]) -> None:
         if field not in current:
             r = invoke("modelFieldAdd", modelName=MASTER_MODEL_NAME, fieldName=field, index=len(current))
             if r.get("error"):
-                logger.warning("Could not add field '%s' to model: %s", field, r["error"])
+                raise ValueError("Could not add field '%s': %s", field, r["error"])
             else:
                 current.add(field)
-                print(f"  + Added field '{field}' to {MASTER_MODEL_NAME}")
+                logger.info(f"  + Added field '{field}' to {MASTER_MODEL_NAME}")
 
 
-def _update_note_in_place(mc: MasterGenkiCard) -> None:
-    note_id       = int(mc.source_note.noteId)
-    result = invoke("updateNoteFields", note={"id": note_id, "fields": mc.to_anki_fields()})
+def _update_note_in_place(mc: "MasterGenkiCard") -> None:
+    note_id = int(mc.source_note.noteId)
+    result  = invoke("updateNoteFields", note={"id": note_id, "fields": mc.to_anki_fields()})
     if result.get("error"):
-        print(f"  ✗ updateNoteFields failed for {note_id}: {result['error']}")
+        logger.error(f"  ✗ updateNoteFields failed for {note_id}: {result['error']}")
     else:
-        print(f"  ✓ Updated note {note_id} in place")
+        logger.info(f"  ✓ Updated {note_id}")
 
 
 def _copy_referenced_media(cards: list[Card], media_src: Path, media_dst: Path) -> None:
     img_re   = re.compile(r'<img\s+[^>]*src="([^"]+)"')
     sound_re = re.compile(r'\[sound:([^\]]+)\]')
-
     referenced: set[str] = set()
     for card in cards:
         for field in card.fields:
             referenced.update(img_re.findall(field.value))
             referenced.update(sound_re.findall(field.value))
-
     media_dst.mkdir(parents=True, exist_ok=True)
     copied = skipped = 0
     for filename in referenced:
@@ -740,90 +1151,75 @@ def _copy_referenced_media(cards: list[Card], media_src: Path, media_dst: Path) 
             skipped += 1
             continue
         if not src.exists():
-            logger.warning("Referenced media file not found: %s", src)
+            logger.warning("Missing media: %s", src)
             continue
-        import shutil
         shutil.copy2(src, dst)
         copied += 1
+    logger.info("Media: %d copied, %d already present, %d total referenced", copied, skipped, len(referenced))
 
-    logger.info(
-        "Media export: %d copied, %d already present, %d total referenced",
-        copied, skipped, len(referenced),
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# The three modes
-# ─────────────────────────────────────────────────────────────────────────────
 
 def mode_export(deck_name: str, out_csv: Path, media_src: Path, media_dst: Path | None, sample: int | None) -> None:
     deck = Deck.from_anki(deck_name)
     if sample:
         deck.cards = random.sample(deck.cards, min(sample, len(deck.cards)))
-    logger.info("Loaded %d cards from Anki deck '%s'", len(deck.cards), deck_name)
+    logger.info("Loaded %d cards from '%s'", len(deck.cards), deck_name)
     write_raw_csv(deck.cards, out_csv)
     if media_dst is not None:
         _copy_referenced_media(deck.cards, media_src, media_dst)
-    else:
-        logger.info("No --media-out specified; skipping media export")
 
-
-TRANSFORM_BATCH_SIZE = 100
 
 def mode_transform(in_csv: Path, out_csv: Path, media_path: Path, sample: int | None) -> None:
-    """raw_cards.csv + media folder → transformed_cards.csv  (LLM runs here)
-
-    Resumes automatically: any noteId already present in out_csv is skipped.
-    Results are flushed to disk after every batch of TRANSFORM_BATCH_SIZE cards.
-    """
-
-    # ── Determine which noteIds are already done ──────────────────────────────
     already_done: set[str] = set()
     if out_csv.exists():
         with open(out_csv, newline="", encoding="utf-8") as fh:
             for row in csv.DictReader(fh):
                 if nid := row.get("noteId"):
                     already_done.add(nid)
-        logger.info("Resuming — %d cards already in %s, will skip them", len(already_done), out_csv)
+        logger.info("Resuming — %d noteIds already done", len(already_done))
 
-    # ── Load and filter raw cards ─────────────────────────────────────────────
     all_cards = read_raw_csv(in_csv)
     if sample:
         all_cards = random.sample(all_cards, min(sample, len(all_cards)))
 
-    pending: list[Card] = []
+    pending_no_llm: list[Card] = []
+    pending_llm:    list[Card] = []
+
     for card in all_cards:
         if card.noteId in already_done:
-            logger.info("Skipping note %s — cardType '%s' already transformed", card.noteId, card.cardType)
             continue
         if card.cardType == MASTER_MODEL_NAME:
-            logger.info("Skipping note %s — already '%s', no transform needed", card.noteId, MASTER_MODEL_NAME)
+            logger.info("Skipping %s — already master", card.noteId)
             continue
-        pending.append(card)
+        if card.cardType in NO_LLM_CARD_TYPES:
+            pending_no_llm.append(card)
+        elif card.cardType in LLM_CARD_TYPES:
+            pending_llm.append(card)
+        else:
+            logger.warning("Unknown card type '%s' for note %s — skipping", card.cardType, card.noteId)
 
-    skipped = len(all_cards) - len(pending)
-    logger.info(
-        "%d total cards | %d skipped (already done or already master) | %d to transform",
-        len(all_cards), skipped, len(pending),
-    )
+    logger.info("%d no-LLM cards | %d LLM cards", len(pending_no_llm), len(pending_llm))
 
-    # ── Build prompt requests, skipping cards that error at prep time ─────────
+    no_llm_results: list[MasterGenkiCard] = []
+    for card in pending_no_llm:
+        try:
+            no_llm_results.extend(transform_no_llm(card))
+        except Exception as e:
+            logger.warning("No-LLM transform failed for %s: %s", card.noteId, e)
+
+    if no_llm_results:
+        write_transformed_csv(no_llm_results, out_csv, append=True)
+        logger.info("No-LLM: wrote %d cards", len(no_llm_results))
+
     requests_list: list[PromptRequest] = []
     valid_cards:   list[Card]          = []
-    for card in pending:
+    for card in pending_llm:
         try:
             requests_list.append(build_prompt_request_for_card(card, media_path))
             valid_cards.append(card)
         except Exception as e:
-            logger.warning("Skipping card %s (%s) — prompt build failed: %s", card.noteId, card.cardType, e)
+            logger.warning("Prompt build failed for %s: %s", card.noteId, e)
 
-    if not valid_cards:
-        logger.info("Nothing to transform.")
-        return
-
-    # ── Process in batches, saving after each ────────────────────────────────
-    total_ok  = 0
-    total_fail = 0
+    total_ok = total_fail = 0
     num_batches = (len(valid_cards) + TRANSFORM_BATCH_SIZE - 1) // TRANSFORM_BATCH_SIZE
 
     for batch_idx in range(num_batches):
@@ -832,64 +1228,43 @@ def mode_transform(in_csv: Path, out_csv: Path, media_path: Path, sample: int | 
         batch_cards    = valid_cards[lo:hi]
         batch_requests = requests_list[lo:hi]
 
-        logger.info(
-            "Batch %d/%d — sending %d cards to LLM (notes %s … %s)",
-            batch_idx + 1, num_batches, len(batch_cards),
-            batch_cards[0].noteId, batch_cards[-1].noteId,
-        )
-
+        logger.info("LLM batch %d/%d — %d cards", batch_idx + 1, num_batches, len(batch_cards))
         llm_outputs = prompt_batch(batch_requests)
 
         batch_master: list[MasterGenkiCard] = []
         for card, raw in zip(batch_cards, llm_outputs):
             if not raw:
-                logger.warning("No LLM output for card %s", card.noteId)
+                logger.warning("No LLM output for %s", card.noteId)
                 total_fail += 1
                 continue
             try:
-                batch_master.append(assemble_master_card(card, raw))
+                batch_master.append(assemble_master_card_from_llm(card, raw))
                 total_ok += 1
             except Exception as e:
-                logger.warning("Assembly failed for card %s: %s | raw: %.120s", card.noteId, e, raw)
+                logger.warning("Assembly failed for %s: %s | raw: %.120s", card.noteId, e, raw)
                 total_fail += 1
 
-        # Append this batch to the output CSV immediately
         write_transformed_csv(batch_master, out_csv, append=True)
-        logger.info(
-            "Batch %d/%d complete — %d transformed, %d failed. "
-            "Running totals: %d ok / %d failed. Saved → %s",
-            batch_idx + 1, num_batches, len(batch_master),
-            len(batch_cards) - len(batch_master),
-            total_ok, total_fail, out_csv,
-        )
+        logger.info("Batch %d/%d done — %d ok / %d failed (running: %d/%d)",
+                    batch_idx + 1, num_batches,
+                    len(batch_master), len(batch_cards) - len(batch_master),
+                    total_ok, total_fail)
 
-    logger.info(
-        "Transform finished — %d succeeded, %d failed out of %d attempted",
-        total_ok, total_fail, len(valid_cards),
-    )
+    logger.info("Transform complete — %d ok, %d failed", total_ok, total_fail)
 
 
 def mode_import(in_csv: Path, dry_run: bool) -> None:
-    """transformed_cards.csv → AnkiConnect (in-place update, preserves review history)"""
     master_cards = read_transformed_csv(in_csv)
     if dry_run:
-        print(f"DRY RUN — would import {len(master_cards)} cards (pass --no-dry-run to commit)")
-        for mc in master_cards[:3]:
-            print(f"  {mc.source_note.noteId}: {mc.japanese[:40]}")
+        logger.info(f"DRY RUN — {len(master_cards)} cards (pass --no-dry-run to commit)")
+        for mc in master_cards[:5]:
+            logger.info(f"  {mc.source_note.noteId}: {mc.japanese[:50]}")
         return
 
-    _ensure_model_fields([
-        "Japanese", "Japanese Audio", "Furigana", "Reading",
-        "English", "English Audio", "Screenshots", "Screenshot Text",
-        "Explanations", "Additional Notes", "Previous Version", "Tags",
-    ])
+    _ensure_model_fields(_ANKI_FIELD_NAMES)
     for mc in master_cards:
         _update_note_in_place(mc)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -897,29 +1272,22 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    # ── export ────────────────────────────────────────────────────────────────
     p_export = sub.add_parser("export", help="AnkiConnect → CSV")
-    p_export.add_argument("--deck",      default=DEFAULT_DECK,        help="Anki deck name")
-    p_export.add_argument("--out",       default=DEFAULT_RAW_CSV,     type=Path)
-    p_export.add_argument("--media-src", default=DEFAULT_MEDIA_PATH,  type=Path,
-                          help="Anki collection.media source folder")
-    p_export.add_argument("--media-out", default=None,                type=Path,
-                          help="Destination folder for referenced media files (optional)")
-    p_export.add_argument("--sample",    default=None,                type=int)
+    p_export.add_argument("--deck",      default=DEFAULT_DECK)
+    p_export.add_argument("--out",       default=DEFAULT_RAW_CSV, type=Path)
+    p_export.add_argument("--media-src", default=DEFAULT_MEDIA_PATH, type=Path)
+    p_export.add_argument("--media-out", default=None, type=Path)
+    p_export.add_argument("--sample",    default=None, type=int)
 
-    # ── transform ─────────────────────────────────────────────────────────────
-    p_transform = sub.add_parser("transform", help="CSV → LLM → CSV (run on server)")
+    p_transform = sub.add_parser("transform", help="CSV → (LLM) → CSV")
     p_transform.add_argument("--in",     dest="in_csv",  default=DEFAULT_RAW_CSV, type=Path)
     p_transform.add_argument("--out",    dest="out_csv", default=DEFAULT_OUT_CSV, type=Path)
-    p_transform.add_argument("--media",  default=DEFAULT_MEDIA_PATH,              type=Path,
-                             help="Path to media folder (copied during export)")
-    p_transform.add_argument("--sample", default=None,                            type=int)
+    p_transform.add_argument("--media",  default=DEFAULT_MEDIA_PATH, type=Path)
+    p_transform.add_argument("--sample", default=None, type=int)
 
-    # ── import ────────────────────────────────────────────────────────────────
     p_import = sub.add_parser("import", help="transformed CSV → AnkiConnect")
     p_import.add_argument("--in",         dest="in_csv", default=DEFAULT_OUT_CSV, type=Path)
-    p_import.add_argument("--no-dry-run", dest="dry_run", action="store_false", default=True,
-                          help="Actually write to Anki (default is dry-run)")
+    p_import.add_argument("--no-dry-run", dest="dry_run", action="store_false", default=True)
 
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
