@@ -589,7 +589,7 @@ def _base_sentence_prompt(card_name: str, front_content: str, additional_rules: 
     rules.extend(additional_rules)
     str_rules = ""
     for i, rule in enumerate(rules):
-        str_rules = f"\n{i+1}. {rule}"
+        str_rules += f"\n{i+1}. {rule}"
     return f"""\
 You are an expert Japanese language tutor and Anki card formatter.
 
@@ -848,7 +848,7 @@ def transform_core2000(card: Card) -> tuple["MasterGenkiCard", "MasterGenkiCard"
         english_audio        = sent_eng_audio,
         screenshots          = [],
         explanations         = f"Vocabulary in context: {vocab_kanji} ({vocab_english})",
-        additional_notes     = sentence_additional_notes,
+        additional_notes     = "\n".join(sentence_additional_notes),
         screenshot_text      = "",
         tags                 = base_tags + ["type::sentence"],
         llm_translator       = "gemma4-31b",
@@ -897,7 +897,7 @@ def transform_video(card: Card) -> "MasterGenkiCard":
             card_subtype = "sentence",
             extra        = ["source_media::cij"],
         ),
-        llm_translator       = "gemma4-31b",
+        llm_translator       = "gemma4-31b",  # english provided by this beforehand
         japanese_audio_model = "video_bundled",
         english_audio_model  = "kokoro_af_heart",
         source               = source,
@@ -1064,7 +1064,7 @@ def _llm_card_tags(card: Card) -> list[str]:
     if "Japanese Video Sentence Cards" in ct:
         return build_tags(source_deck="Japanese Video Deck", card_subtype="sentence")
 
-    return build_tags(source_deck="unknown")
+    return ValueError(f"Unsupported llm card type: '{ct}'")
 
 NO_LLM_CARD_TYPES = {"Core 2000", "Japanese Video Sentence Cards+"}
 LLM_CARD_TYPES    = {"Basic", "Basic (split)", "Genki Practice Card", "Genki Vocab Card",
@@ -1119,7 +1119,7 @@ def _ensure_model_fields(field_names: list[str]) -> None:
         if field not in current:
             r = invoke("modelFieldAdd", modelName=MASTER_MODEL_NAME, fieldName=field, index=len(current))
             if r.get("error"):
-                raise ValueError("Could not add field '%s': %s", field, r["error"])
+                raise ValueError(f"Could not add field '{field}': {r['error']}")
             else:
                 current.add(field)
                 logger.info(f"  + Added field '{field}' to {MASTER_MODEL_NAME}")
