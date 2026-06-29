@@ -8,3 +8,4 @@ yomitan-jlpt-vocab/
 .DS_Store
 **/__pycache__/*
 models/*
+pipeline/*

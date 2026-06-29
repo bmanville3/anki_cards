@@ -58,6 +58,12 @@ DECKS = [
 ]
 
 
+def slug_for_subdeck(parent_slug: str, deck_name: str) -> str:
+    parts = deck_name.split("::")
+    child_parts = parts[1:] if len(parts) > 1 else parts
+    return "__".join(p.lower().replace(" ", "_") for p in child_parts)
+
+
 def run(cmd: list[str], desc: str) -> bool:
     logger.info("▶ %s", desc)
     result = subprocess.run(cmd, text=True)
@@ -67,9 +73,25 @@ def run(cmd: list[str], desc: str) -> bool:
     return True
 
 
-def export_deck(cfg: DeckConfig, media_out: Path, raw_csv: Path, sample: int | None) -> bool:
-    decks_to_export = cfg.subdecks if cfg.subdecks else [cfg.deck]
-    for deck_name in decks_to_export:
+def iter_leaf_dirs(cfg: DeckConfig, parent_dir: Path) -> list[tuple[str, Path]]:
+    """
+    Returns a list of (deck_name, deck_dir) pairs — one per leaf to process.
+    Flat decks:    [(cfg.deck, parent_dir)]
+    Subdecks:      [("Deck::Sub1", parent_dir/sub1), ("Deck::Sub2", parent_dir/sub2), ...]
+    """
+    if not cfg.subdecks:
+        return [(cfg.deck, parent_dir)]
+    return [
+        (subdeck, parent_dir / slug_for_subdeck(cfg.slug, subdeck))
+        for subdeck in cfg.subdecks
+    ]
+
+
+def export_deck(cfg: DeckConfig, parent_dir: Path, sample: int | None) -> bool:
+    for deck_name, deck_dir in iter_leaf_dirs(cfg, parent_dir):
+        deck_dir.mkdir(parents=True, exist_ok=True)
+        raw_csv   = deck_dir / "raw_cards.csv"
+        media_out = deck_dir / "media"
         cmd = [
             sys.executable, str(SCRIPT), "export",
             "--deck",      deck_name,
@@ -79,31 +101,51 @@ def export_deck(cfg: DeckConfig, media_out: Path, raw_csv: Path, sample: int | N
         ]
         if sample:
             cmd += ["--sample", str(sample)]
-        if not run(cmd, f"export '{deck_name}'"):
+        if not run(cmd, f"export '{deck_name}' → {raw_csv}"):
             return False
     return True
 
 
-def transform_deck(raw_csv: Path, transformed_csv: Path, media_out: Path, sample: int | None) -> bool:
-    cmd = [
-        sys.executable, str(SCRIPT), "transform",
-        "--in",    str(raw_csv),
-        "--out",   str(transformed_csv),
-        "--media", str(media_out),
-    ]
-    if sample:
-        cmd += ["--sample", str(sample)]
-    return run(cmd, f"transform '{raw_csv.name}'")
+def transform_deck(cfg: DeckConfig, parent_dir: Path, sample: int | None) -> bool:
+    ok = True
+    for _, deck_dir in iter_leaf_dirs(cfg, parent_dir):
+        raw_csv         = deck_dir / "raw_cards.csv"
+        transformed_csv = deck_dir / "transformed_cards.csv"
+        media_out       = deck_dir / "media"
+        if not raw_csv.exists():
+            logger.warning("No raw CSV at '%s', skipping", raw_csv)
+            ok = False
+            continue
+        cmd = [
+            sys.executable, str(SCRIPT), "transform",
+            "--in",    str(raw_csv),
+            "--out",   str(transformed_csv),
+            "--media", str(media_out),
+        ]
+        if sample:
+            cmd += ["--sample", str(sample)]
+        if not run(cmd, f"transform '{raw_csv}'"):
+            ok = False
+    return ok
 
 
-def import_deck(transformed_csv: Path, dry_run: bool) -> bool:
-    cmd = [
-        sys.executable, str(SCRIPT), "import",
-        "--in", str(transformed_csv),
-    ]
-    if not dry_run:
-        cmd.append("--no-dry-run")
-    return run(cmd, f"import '{transformed_csv.name}'" + (" (dry run)" if dry_run else ""))
+def import_deck(cfg: DeckConfig, parent_dir: Path, dry_run: bool) -> bool:
+    ok = True
+    for _, deck_dir in iter_leaf_dirs(cfg, parent_dir):
+        transformed_csv = deck_dir / "transformed_cards.csv"
+        if not transformed_csv.exists():
+            logger.warning("No transformed CSV at '%s', skipping", transformed_csv)
+            ok = False
+            continue
+        cmd = [
+            sys.executable, str(SCRIPT), "import",
+            "--in", str(transformed_csv),
+        ]
+        if not dry_run:
+            cmd.append("--no-dry-run")
+        if not run(cmd, f"import '{transformed_csv}'" + (" (dry run)" if dry_run else "")):
+            ok = False
+    return ok
 
 
 def add_common_args(p: argparse.ArgumentParser) -> None:
@@ -145,32 +187,18 @@ def main() -> None:
     failures: list[str] = []
 
     for cfg in decks:
-        deck_dir        = WORK_DIR / cfg.slug
-        media_out       = deck_dir / "media"
-        raw_csv         = deck_dir / "raw_cards.csv"
-        transformed_csv = deck_dir / "transformed_cards.csv"
-        deck_dir.mkdir(parents=True, exist_ok=True)
-
+        parent_dir = WORK_DIR / cfg.slug
+        parent_dir.mkdir(parents=True, exist_ok=True)
         logger.info("━━━ %s ━━━", cfg.deck)
 
         if args.step == "export":
-            if not export_deck(cfg, media_out, raw_csv, args.sample):
+            if not export_deck(cfg, parent_dir, args.sample):
                 failures.append(f"{cfg.slug}:export")
-
         elif args.step == "transform":
-            if not raw_csv.exists():
-                logger.warning("No raw CSV for '%s', skipping", cfg.slug)
-                failures.append(f"{cfg.slug}:transform:no_raw_csv")
-                continue
-            if not transform_deck(raw_csv, transformed_csv, media_out, args.sample):
+            if not transform_deck(cfg, parent_dir, args.sample):
                 failures.append(f"{cfg.slug}:transform")
-
         elif args.step == "import":
-            if not transformed_csv.exists():
-                logger.warning("No transformed CSV for '%s', skipping", cfg.slug)
-                failures.append(f"{cfg.slug}:import:no_transformed_csv")
-                continue
-            if not import_deck(transformed_csv, args.dry_run):
+            if not import_deck(cfg, parent_dir, args.dry_run):
                 failures.append(f"{cfg.slug}:import")
 
     logger.info("━━━ Done ━━━")

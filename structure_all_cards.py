@@ -51,10 +51,14 @@ logger = logging.getLogger(__name__)
 
 
 def attr_name_to_anki_field(name: str) -> str:
+    if name == "LLM Translator":
+        return "llm_translator"
     return " ".join(word.capitalize() for word in name.split("_"))
 
 
 def anki_field_to_attr_name(field: str) -> str:
+    if field == "llm_translator":
+        return "LLM Translator"
     return "_".join(word.lower() for word in field.split())
 
 
@@ -461,7 +465,9 @@ _ANKI_FIELD_NAMES = [
     "English", "English Audio",
     "Screenshots", "Screenshot Text",
     "Explanations", "Additional Notes",
-    "Previous Version",
+    "Previous Version", "LLM Translator",
+    "Japanese Audio Model", "English Audio Model",
+    "Source",
 ]
 
 
@@ -917,7 +923,7 @@ def transform_core2000(card: Card) -> tuple["MasterGenkiCard", "MasterGenkiCard"
         additional_notes     = "",
         screenshot_text      = "",
         tags                 = base_tags + ["type::vocab"],
-        llm_translator       = "gemma4-31b",
+        llm_translator       = "core2000_bundled",
         japanese_audio_model = "core2000_bundled",
         english_audio_model  = "kokoro_af_heart",
         source               = "Core 2000",
@@ -1236,7 +1242,30 @@ def _add_new_note(mc: "MasterGenkiCard") -> None:
         },
     )
     if result.get("error"):
-        logger.error(f"  ✗ addNote failed for sentence of {mc.source_note.noteId}: {result['error']}")
+        error_msg = result["error"]
+        if "duplicate" in error_msg.lower():
+            logger.info(
+                f"  ~ addNote duplicate detected for parent {mc.source_note.noteId}, "
+                f"searching for existing note to update"
+            )
+            escaped = mc.japanese.replace('"', '\\"')
+            find    = invoke("findNotes", query=f'note:"{MASTER_MODEL_NAME}" Japanese:"{escaped}"')
+            ids     = find.get("result") or []
+            if not ids:
+                logger.error(
+                    f"  ✗ Could not locate duplicate note for '{mc.japanese}' "
+                    f"(parent {mc.source_note.noteId})"
+                )
+                return
+            dup_id = ids[0]
+            if len(ids) > 1:
+                logger.warning(f"  ~ {len(ids)} duplicates found for '{mc.japanese}', using {dup_id}")
+            mc.source_note.noteId = str(dup_id)
+            _update_note_in_place(mc)
+        else:
+            logger.error(
+                f"  ✗ addNote failed for sentence of {mc.source_note.noteId}: {error_msg}"
+            )
     else:
         logger.info(f"  ✓ Added new sentence note (parent {mc.source_note.noteId}) → new id {result.get('result')}")
 
@@ -1326,7 +1355,7 @@ def mode_transform(in_csv: Path, out_csv: Path, media_path: Path, sample: int | 
         except Exception as e:
             logger.warning("Prompt build failed for %s: %s", card.noteId, e)
 
-    total_ok = total_fail = 0
+    total_ok = total_fail = total_partial = 0
     num_batches = (len(valid_cards) + TRANSFORM_BATCH_SIZE - 1) // TRANSFORM_BATCH_SIZE
 
     for batch_idx in range(num_batches):
@@ -1340,22 +1369,25 @@ def mode_transform(in_csv: Path, out_csv: Path, media_path: Path, sample: int | 
 
         batch_master: list[MasterGenkiCard] = []
         for card, raw in zip(batch_cards, llm_outputs):
+            trying_partial = False
             if not raw:
                 logger.warning("No LLM output for %s", card.noteId)
-                total_fail += 1
-                continue
+                trying_partial = True
             try:
                 batch_master.append(assemble_master_card_from_llm(card, raw))
-                total_ok += 1
+                if trying_partial:
+                    total_partial += 1
+                else:
+                    total_ok += 1
             except Exception as e:
                 logger.warning("Assembly failed for %s: %s | raw: %.120s", card.noteId, e, raw)
                 total_fail += 1
 
         write_transformed_csv(batch_master, out_csv, append=True)
-        logger.info("Batch %d/%d done — %d ok / %d failed (running: %d/%d)",
+        logger.info("Batch %d/%d done — %d ok or partial / %d failed (running: %d/%d/%d)",
                     batch_idx + 1, num_batches,
                     len(batch_master), len(batch_cards) - len(batch_master),
-                    total_ok, total_fail)
+                    total_ok, total_partial, total_fail)
 
     logger.info("Transform complete — %d ok, %d failed", total_ok, total_fail)
 
