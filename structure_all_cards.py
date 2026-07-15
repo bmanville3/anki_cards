@@ -248,6 +248,7 @@ CARD_TYPE_VERIFIERS: dict[str, Callable[["Card"], None]] = {
     "JlabNote-JlabConverted-1":     _verify_jlab,
     "Wild Cards":                   _verify_wild,
     MASTER_MODEL_NAME:              _noop,
+    "skip-verifier":                _noop,
 }
 
 SPLIT_TYPE_MAP = {
@@ -256,6 +257,8 @@ SPLIT_TYPE_MAP = {
     "Genki Vocab Card":    "Genki Vocab Card Split",
 }
 
+CARD_HEADER_RE = re.compile(r"^Card (?P<noteId>[^\n]+)\n- Fields:\n\t(?P<body>.*)$", re.DOTALL)
+FIELD_RE       = re.compile(r"^(?P<name>[^:\n]+): (?P<value>.*)$", re.DOTALL)
 
 @define
 class Card:
@@ -306,6 +309,32 @@ class Card:
     def pretty_string(self) -> str:
         joined = "\n\t".join(f.pretty_string() for f in self.fields)
         return f"Card {self.noteId}\n- Fields:\n\t{joined}"
+
+    @classmethod
+    def from_pretty_string(cls, s: str, cardType: str) -> "Card":
+        """
+        Parses the output of pretty_string() back into a Card.
+
+        NOTE: pretty_string() does not encode cardType, so it must be supplied
+        separately. Parsing also assumes no field's value contains the literal
+        sequence "\n\t" (used as the field separator) — if it does, this will
+        incorrectly split that value into multiple fields.
+        """
+        m = CARD_HEADER_RE.match(s)
+        if not m:
+            raise ValueError(f"String does not match expected pretty_string format:\n{s}")
+
+        noteId = m.group("noteId")
+        body   = m.group("body")
+
+        fields = []
+        for chunk in body.split("\n\t"):
+            fm = FIELD_RE.match(chunk)
+            if not fm:
+                raise ValueError(f"Could not parse field chunk: {chunk!r}")
+            fields.append(Field(fm.group("name"), fm.group("value")))
+
+        return cls(noteId=noteId, cardType=cardType, fields=fields)
 
     def get_field(self, name: str) -> str:
         for f in self.fields:
