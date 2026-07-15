@@ -80,12 +80,12 @@ for i, note in enumerate(info):
     tag_set = set(tags)
 
     if "English" not in fields:
-        print(f"  Skipping {note_id}: missing expected fields for modelName={note['modelName']}")
+        print(f"  Skipping {note_id=}: missing expected fields for modelName={note['modelName']}")
         continue
     
     english = strip_html(fields["English"]["value"]).strip()
     if not english:
-        print(f"  Skipping {note_id}: empty english field")
+        print(f"  Skipping {note_id=}: empty english field")
         continue
     
 
@@ -105,8 +105,8 @@ for i, note in enumerate(info):
             word_file.unlink()
             generate_tts(text=english, out_path=word_file, voice=voice)
         else:
-            if VERBOSE:
-                print(f"  Skipping existing {word_file.name}")
+            print(f"  Skipping existing {word_file.name}")
+            print(f"  This was unexpected as 'English Audio' for {note_id=} was empty but the file exists")
             continue
     else:
         generate_tts(text=english, out_path=word_file, voice=voice)
